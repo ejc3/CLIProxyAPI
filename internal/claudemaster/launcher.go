@@ -162,7 +162,7 @@ func ChildEnvironment(environ, args []string, proxyURL, caPath string) ([]string
 		"NODE_EXTRA_CA_CERTS": true, "CLAUDE_CODE_CHILD_SESSION": true,
 		"CLAUDE_CODE_SESSION_ID": true, "REMOTE_CLAW_SECRET_FILE": true,
 		"VERCEL_AUTOMATION_BYPASS_SECRET": true,
-		"DISABLE_AUTOUPDATER": true,
+		"DISABLE_AUTOUPDATER":             true,
 	}
 	settingsSeen := false
 	for i := 0; i < len(args); i++ {

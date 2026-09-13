@@ -30,7 +30,11 @@ func TestInvalidArgumentsStopBeforeProfileOrLogin(t *testing.T) {
 func TestRepeatedProfileFlagRetainsOrder(t *testing.T) {
 	var profiles profileNamesFlag
 	for _, name := range []string{"second", "third", "fourth"} {
-		if err := profiles.Set(name); err != nil { t.Fatal(err) }
+		if err := profiles.Set(name); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if profiles.String() != "second,third,fourth" { t.Fatalf("profile order lost: %v", profiles) }
+	if profiles.String() != "second,third,fourth" {
+		t.Fatalf("profile order lost: %v", profiles)
+	}
 }

@@ -10,7 +10,7 @@ import (
 func TestNativeClaudeProtocolHeadersBoundary(t *testing.T) {
 	safe := http.Header{
 		"User-Agent": {"claude-cli/2.1.270 (external, sdk-cli)"},
-		"Accept": {"application/json"}, "Accept-Encoding": {"gzip, deflate, br, zstd"},
+		"Accept":     {"application/json"}, "Accept-Encoding": {"gzip, deflate, br, zstd"},
 		"Anthropic-Beta": {"native-beta-a", "native-beta-b"}, "Anthropic-Version": {"2023-06-01"},
 		"X-Stainless-Os": {"MacOS"}, "X-Stainless-Arch": {"arm64"},
 		"X-Stainless-Package-Version": {"0.112.1"}, "X-Stainless-Runtime-Version": {"v26.3.0"},

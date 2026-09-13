@@ -367,9 +367,9 @@ const (
 	BackendErrorTLS                BackendErrorStage = "tls"
 	BackendErrorTransport          BackendErrorStage = "transport"
 	// SDK status-bearing errors can be local validation or actual upstream HTTP.
-	BackendErrorUpstreamHTTP       BackendErrorStage = "http_error"
-	BackendErrorResponse           BackendErrorStage = "response"
-	BackendErrorInternal           BackendErrorStage = "internal"
+	BackendErrorUpstreamHTTP BackendErrorStage = "http_error"
+	BackendErrorResponse     BackendErrorStage = "response"
+	BackendErrorInternal     BackendErrorStage = "internal"
 )
 
 type backendErrorObservationKey struct{}

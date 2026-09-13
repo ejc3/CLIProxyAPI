@@ -392,11 +392,19 @@ func proxyLegacySessionPath(method, path string) bool {
 		return method == http.MethodPost
 	}
 	suffix, ok := strings.CutPrefix(path, "/v1/sessions/")
-	if !ok { return false }
+	if !ok {
+		return false
+	}
 	parts := strings.Split(suffix, "/")
-	if !proxyControlID(parts[0]) { return false }
-	if len(parts) == 1 { return method == http.MethodGet || method == http.MethodPatch }
-	if len(parts) != 2 || method != http.MethodPost { return false }
+	if !proxyControlID(parts[0]) {
+		return false
+	}
+	if len(parts) == 1 {
+		return method == http.MethodGet || method == http.MethodPatch
+	}
+	if len(parts) != 2 || method != http.MethodPost {
+		return false
+	}
 	return parts[1] == "events" || parts[1] == "archive" || parts[1] == "unarchive"
 }
 
@@ -406,9 +414,15 @@ func proxyLegacySessionRequest(r *http.Request) bool {
 	for _, value := range r.Header.Values("Anthropic-Beta") {
 		for _, token := range strings.Split(value, ",") {
 			token = strings.TrimSpace(token)
-			if strings.Contains(strings.ToLower(token), "managed-agents") { return false }
-			if token == "ccr-byoc-2025-07-29" { byoc = true }
-			if token == "environments-2025-11-01" { environments = true }
+			if strings.Contains(strings.ToLower(token), "managed-agents") {
+				return false
+			}
+			if token == "ccr-byoc-2025-07-29" {
+				byoc = true
+			}
+			if token == "environments-2025-11-01" {
+				environments = true
+			}
 		}
 	}
 	crudProfile := byoc && proxyControlID(r.Header.Get("X-Organization-Uuid"))
@@ -418,48 +432,78 @@ func proxyLegacySessionRequest(r *http.Request) bool {
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/sessions/"), "/")
 	bridgeCallback := r.Method == http.MethodPost && len(parts) == 2 && (parts[1] == "events" || parts[1] == "archive")
 	bridgeProfile := environments && bridgeCallback && proxyLegacyRunnerVersion(r.Header.Get("X-Environment-Runner-Version"))
-	if !crudProfile && !bridgeProfile { return false }
-	if r.URL.Path != "/v1/sessions" { return true }
-	if r.Body == nil || (r.Header.Get("Content-Encoding") != "" && r.Header.Get("Content-Encoding") != "identity") { return false }
+	if !crudProfile && !bridgeProfile {
+		return false
+	}
+	if r.URL.Path != "/v1/sessions" {
+		return true
+	}
+	if r.Body == nil || (r.Header.Get("Content-Encoding") != "" && r.Header.Get("Content-Encoding") != "identity") {
+		return false
+	}
 	raw, err := io.ReadAll(io.LimitReader(r.Body, backendMaxBodyBytes+1))
 	_ = r.Body.Close()
-	if err != nil || len(raw) > backendMaxBodyBytes { return false }
+	if err != nil || len(raw) > backendMaxBodyBytes {
+		return false
+	}
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	var body map[string]json.RawMessage
-	if json.Unmarshal(raw, &body) != nil || body == nil { return false }
+	if json.Unmarshal(raw, &body) != nil || body == nil {
+		return false
+	}
 	for key := range body {
 		switch key {
 		case "source", "events", "session_context", "environment_id", "self_hosted_runner_pool_id", "title", "tags", "permission_mode":
-		default: return false
+		default:
+			return false
 		}
 	}
 	var source string
-	if json.Unmarshal(body["source"], &source) != nil || source != "remote-control" { return false }
+	if json.Unmarshal(body["source"], &source) != nil || source != "remote-control" {
+		return false
+	}
 	var events []json.RawMessage
-	if json.Unmarshal(body["events"], &events) != nil || events == nil { return false }
+	if json.Unmarshal(body["events"], &events) != nil || events == nil {
+		return false
+	}
 	var session map[string]json.RawMessage
-	if json.Unmarshal(body["session_context"], &session) != nil || session == nil { return false }
+	if json.Unmarshal(body["session_context"], &session) != nil || session == nil {
+		return false
+	}
 	for key := range session {
 		switch key {
 		case "sources", "outcomes", "model", "cwd", "reuse_outcome_branches":
-		default: return false
+		default:
+			return false
 		}
 	}
 	_, environment := body["environment_id"]
 	_, pool := body["self_hosted_runner_pool_id"]
-	if environment == pool { return false }
+	if environment == pool {
+		return false
+	}
 	key := "environment_id"
-	if pool { key = "self_hosted_runner_pool_id" }
+	if pool {
+		key = "self_hosted_runner_pool_id"
+	}
 	var worker string
 	return json.Unmarshal(body[key], &worker) == nil && proxyControlID(worker)
 }
 
 func proxyLegacyRunnerVersion(version string) bool {
 	parts := strings.Split(version, ".")
-	if len(parts) != 3 { return false }
+	if len(parts) != 3 {
+		return false
+	}
 	for _, part := range parts {
-		if len(part) == 0 || len(part) > 8 { return false }
-		for _, char := range part { if char < '0' || char > '9' { return false } }
+		if len(part) == 0 || len(part) > 8 {
+			return false
+		}
+		for _, char := range part {
+			if char < '0' || char > '9' {
+				return false
+			}
+		}
 	}
 	return true
 }
