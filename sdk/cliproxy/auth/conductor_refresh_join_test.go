@@ -14,7 +14,7 @@ type refreshJoinStore struct {
 }
 
 func (s *refreshJoinStore) List(context.Context) ([]*Auth, error) { return nil, nil }
-func (s *refreshJoinStore) Delete(context.Context, string) error  { return nil }
+func (s *refreshJoinStore) Delete(context.Context, string) error { return nil }
 func (s *refreshJoinStore) Save(ctx context.Context, auth *Auth) (string, error) {
 	s.started <- ctx
 	<-s.release

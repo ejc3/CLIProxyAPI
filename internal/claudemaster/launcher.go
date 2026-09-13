@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net/http"
@@ -34,10 +35,25 @@ func Launch(ctx context.Context, profile Profile, model string, args []string) (
 // LaunchWithDiagnostics optionally emits numeric counters and fixed error-stage labels. It never
 // emits proxy credentials, request content, URLs, or account identifiers.
 func LaunchWithDiagnostics(ctx context.Context, profile Profile, model string, args []string, diagnostics io.Writer) (int, error) {
+	return LaunchProfilesWithDiagnostics(ctx, []Profile{profile}, model, args, diagnostics)
+}
+
+// LaunchProfilesWithDiagnostics starts one native master with an ordered inference chain.
+// The caller must hold every candidate profile lock until this returns. Only confirmed quota
+// exhaustion can advance the chain; the native master identity and model never change.
+func LaunchProfilesWithDiagnostics(ctx context.Context, profiles []Profile, model string, args []string, diagnostics io.Writer) (int, error) {
 	if strings.TrimSpace(model) == "" {
 		return 1, errors.New("an explicit backend model is required")
 	}
-	args, err := NativeArguments(profile.Provider, model, args)
+	options, err := profileBackendOptions(profiles, model)
+	if err != nil {
+		return 1, err
+	}
+	args, err = NativeArguments(profiles[0].Provider, model, args)
+	if err != nil {
+		return 1, err
+	}
+	args, err = snapshotNativeHookSettings(args)
 	if err != nil {
 		return 1, err
 	}
@@ -50,11 +66,15 @@ func LaunchWithDiagnostics(ctx context.Context, profile Profile, model string, a
 		return 1, err
 	}
 	defer func() { _ = os.RemoveAll(certs.dir) }()
-	backend, err := NewBackend(ctx, BackendOptions{AuthDir: profile.AuthDir, Provider: profile.Provider, AuthID: profile.AuthID, Model: model})
+	backend, err := NewFallbackBackend(ctx, options)
 	if err != nil {
-		return 1, errors.New("cannot start selected inference backend; check the profile and model")
+		return 1, errors.New("cannot start selected inference backends; check every profile and the shared model")
 	}
 	defer func() { _ = backend.Close() }()
+	backend.SetOnFallback(func(fromIndex, toIndex int) {
+		// Profile names are locally chosen, validated identifiers, never account IDs or tokens.
+		fmt.Fprintf(os.Stderr, "\nclaude-master: inference quota exhausted for %s; using %s. Master login unchanged.\n", profiles[fromIndex].Name, profiles[toIndex].Name)
+	})
 	observation := &backendErrorObservation{}
 	inference := backend.Handler()
 	if diagnostics != nil {
@@ -101,6 +121,25 @@ func LaunchWithDiagnostics(ctx context.Context, profile Profile, model string, a
 	return 0, nil
 }
 
+func profileBackendOptions(profiles []Profile, model string) ([]BackendOptions, error) {
+	if len(profiles) == 0 {
+		return nil, errors.New("at least one inference profile is required")
+	}
+	options := make([]BackendOptions, 0, len(profiles))
+	names := make([]string, 0, len(profiles))
+	for _, profile := range profiles {
+		if profile.Provider != profiles[0].Provider {
+			return nil, errors.New("fallback profiles must use the same provider and model; mixed Claude/Codex fallback is not supported")
+		}
+		names = append(names, profile.Name)
+		options = append(options, BackendOptions{AuthDir: profile.AuthDir, Provider: profile.Provider, AuthID: profile.AuthID, Model: model})
+	}
+	if err := ValidateProfileNames(names); err != nil {
+		return nil, err
+	}
+	return options, nil
+}
+
 // Preflight checks native startup compatibility without opening profiles,
 // acquiring credentials, starting a session, or modifying native settings.
 func Preflight(ctx context.Context, args []string) (string, error) {
@@ -123,12 +162,34 @@ func ChildEnvironment(environ, args []string, proxyURL, caPath string) ([]string
 		"NODE_EXTRA_CA_CERTS": true, "CLAUDE_CODE_CHILD_SESSION": true,
 		"CLAUDE_CODE_SESSION_ID": true, "REMOTE_CLAW_SECRET_FILE": true,
 		"VERCEL_AUTOMATION_BYPASS_SECRET": true,
-		"DISABLE_AUTOUPDATER":             true,
+		"DISABLE_AUTOUPDATER": true,
 	}
-	for _, arg := range args {
+	settingsSeen := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
 		flag := strings.SplitN(arg, "=", 2)[0]
 		switch flag {
-		case "--settings", "--setting-sources", "--sdk-url", "--remote-control-session-id", "--claudeai-user-id", "--claudeai-org-id", "--api-key", "--base-url", "--cwd", "--worktree", "-w":
+		case "--settings":
+			if settingsSeen {
+				return nil, errors.New("native hook settings may only be supplied once")
+			}
+			settingsSeen = true
+			value := strings.TrimPrefix(arg, "--settings=")
+			if arg == "--settings" {
+				i++
+				if i == len(args) {
+					return nil, errors.New("native hook settings require a value")
+				}
+				value = args[i]
+			}
+			// Launch snapshots files first; this boundary never accepts a mutable filename.
+			if _, err := nativeHookSettingsJSON([]byte(value)); err != nil {
+				return nil, err
+			}
+		case "--setting-sources", "--sdk-url", "--remote-control-session-id", "--claudeai-user-id", "--claudeai-org-id", "--api-key", "--base-url", "--cwd", "--worktree", "-w":
 			return nil, errors.New("Claude launcher flags cannot override master identity or provider routing")
 		}
 	}

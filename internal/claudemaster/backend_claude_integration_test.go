@@ -85,10 +85,10 @@ func (rt *claudeIntegrationTransport) RoundTrip(request *http.Request) (*http.Re
 			"Content-Type": {rt.contentType}, "Request-Id": {"selected-request-id"},
 			"Retry-After": {"3"}, "X-Should-Retry": {"false"},
 			"Anthropic-Ratelimit-Unified-Status": {"allowed"},
-			"Set-Cookie":                         {"selected-private-canary"}, "X-Account-Id": {"selected-private-canary"},
+			"Set-Cookie": {"selected-private-canary"}, "X-Account-Id": {"selected-private-canary"},
 		},
-		Body:    io.NopCloser(strings.NewReader(rt.response)),
-		Request: request,
+		Body:       io.NopCloser(strings.NewReader(rt.response)),
+		Request:    request,
 	}, nil
 }
 
@@ -209,10 +209,7 @@ func TestBackendRealClaudeExecutor(t *testing.T) {
 			for key, want := range nativeProtocolFixture() {
 				var got []string
 				for wireKey, values := range upstream.header {
-					if strings.EqualFold(wireKey, key) {
-						got = values
-						break
-					}
+					if strings.EqualFold(wireKey, key) { got = values; break }
 				}
 				if !reflect.DeepEqual(got, want) {
 					t.Errorf("native request header %s changed: got %v want %v", key, got, want)

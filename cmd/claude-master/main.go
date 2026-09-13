@@ -43,19 +43,28 @@ func run(args []string) (int, error) {
 		return 0, nil
 	}
 	if len(args) < 2 {
-		return 2, errors.New("usage: claude-master check; claude-master login PROFILE --provider claude|codex; claude-master probe PROFILE --model MODEL; claude-master run PROFILE --model MODEL [--diagnostics] -- [Claude arguments]")
+		return 2, errors.New("usage: claude-master check; claude-master login PROFILE --provider claude|codex; claude-master probe PROFILE --model MODEL; claude-master run PROFILE [--fallback-profile PROFILE ...] --model MODEL [--diagnostics] -- [Claude arguments]")
 	}
 	command, name := args[0], args[1]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	provider := flags.String("provider", "", "inference login provider")
 	model := flags.String("model", "", "selected backend model")
+	var fallbacks profileNamesFlag
+	flags.Var(&fallbacks, "fallback-profile", "next inference profile on confirmed quota exhaustion (repeatable, in order)")
 	diagnostics := flags.Bool("diagnostics", false, "print numeric proxy counters only")
 	if err := flags.Parse(args[2:]); err != nil {
 		return 2, errors.New("invalid launcher arguments")
 	}
 	if command != "login" && command != "run" && command != "probe" {
 		return 2, errors.New("expected login, run, or probe")
+	}
+	if command != "run" && len(fallbacks) > 0 {
+		return 2, errors.New("--fallback-profile is only supported by run")
+	}
+	names := append([]string{name}, fallbacks...)
+	if err := claudemaster.ValidateProfileNames(names); err != nil {
+		return 2, err
 	}
 	if command == "login" && (*diagnostics || *model != "" || len(flags.Args()) != 0 || (*provider != "claude" && *provider != "codex")) {
 		return 2, errors.New("login requires --provider claude or --provider codex, without model or Claude arguments")
@@ -66,12 +75,12 @@ func run(args []string) (int, error) {
 	if command == "probe" && (*diagnostics || len(flags.Args()) != 0) {
 		return 2, errors.New("probe does not accept Claude arguments or proxy diagnostics")
 	}
-	profileLock, err := claudemaster.OpenProfile(name, command == "login")
-	if err != nil {
-		return 1, err
-	}
-	defer func() { _ = profileLock.Close() }()
 	if command == "login" {
+		profileLock, err := claudemaster.OpenProfile(name, true)
+		if err != nil {
+			return 1, err
+		}
+		defer func() { _ = profileLock.Close() }()
 		reader := bufio.NewReader(os.Stdin)
 		prompt := func(label string) (string, error) {
 			fmt.Fprint(os.Stderr, label)
@@ -87,12 +96,13 @@ func run(args []string) (int, error) {
 		fmt.Fprintln(os.Stdout, "Inference profile saved. Native master login was not changed.")
 		return 0, nil
 	}
-	profile, err := profileLock.Profile()
+	profiles, err := claudemaster.OpenProfiles(names)
 	if err != nil {
 		return 1, err
 	}
+	defer func() { _ = profiles.Close() }()
 	if command == "probe" {
-		result, err := claudemaster.Probe(ctx, profile, *model)
+		result, err := claudemaster.Probe(ctx, profiles.Profiles()[0], *model)
 		if err != nil {
 			return 1, err
 		}
@@ -106,5 +116,13 @@ func run(args []string) (int, error) {
 	if *diagnostics {
 		diagnosticOutput = os.Stderr
 	}
-	return claudemaster.LaunchWithDiagnostics(ctx, profile, *model, flags.Args(), diagnosticOutput)
+	return claudemaster.LaunchProfilesWithDiagnostics(ctx, profiles.Profiles(), *model, flags.Args(), diagnosticOutput)
+}
+
+type profileNamesFlag []string
+
+func (p *profileNamesFlag) String() string { return strings.Join(*p, ",") }
+func (p *profileNamesFlag) Set(value string) error {
+	*p = append(*p, value)
+	return nil
 }

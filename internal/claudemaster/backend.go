@@ -367,9 +367,9 @@ const (
 	BackendErrorTLS                BackendErrorStage = "tls"
 	BackendErrorTransport          BackendErrorStage = "transport"
 	// SDK status-bearing errors can be local validation or actual upstream HTTP.
-	BackendErrorUpstreamHTTP BackendErrorStage = "http_error"
-	BackendErrorResponse     BackendErrorStage = "response"
-	BackendErrorInternal     BackendErrorStage = "internal"
+	BackendErrorUpstreamHTTP       BackendErrorStage = "http_error"
+	BackendErrorResponse           BackendErrorStage = "response"
+	BackendErrorInternal           BackendErrorStage = "internal"
 )
 
 type backendErrorObservationKey struct{}
@@ -379,6 +379,7 @@ type backendErrorObservationKey struct{}
 type backendErrorObservation struct {
 	mu    sync.Mutex
 	stage BackendErrorStage
+	quota bool
 }
 
 func (o *backendErrorObservation) result() BackendErrorStage {
@@ -408,6 +409,13 @@ func observeBackendStage(ctx context.Context, stage BackendErrorStage) {
 func observeBackendError(ctx context.Context, message *interfaces.ErrorMessage) {
 	if message != nil {
 		observeBackendStage(ctx, classifyBackendError(message.Error))
+		if ctx != nil && backendQuotaExhausted(message) {
+			if observation, _ := ctx.Value(backendErrorObservationKey{}).(*backendErrorObservation); observation != nil {
+				observation.mu.Lock()
+				observation.quota = true
+				observation.mu.Unlock()
+			}
+		}
 	}
 }
 

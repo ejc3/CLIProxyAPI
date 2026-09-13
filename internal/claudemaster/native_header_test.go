@@ -12,10 +12,10 @@ import (
 func nativeProtocolFixture() http.Header {
 	return http.Header{
 		"Content-Type": {"application/json"}, "Accept": {"application/json"},
-		"Accept-Encoding":   {"gzip, deflate, br, zstd"},
-		"User-Agent":        {"claude-cli/2.1.269 (external, sdk-cli)"},
+		"Accept-Encoding": {"gzip, deflate, br, zstd"},
+		"User-Agent": {"claude-cli/2.1.269 (external, sdk-cli)"},
 		"Anthropic-Version": {"2023-06-01"},
-		"Anthropic-Beta":    {"claude-code-20250219,oauth-2025-04-20", "native-feature-order-preserved"},
+		"Anthropic-Beta": {"claude-code-20250219,oauth-2025-04-20", "native-feature-order-preserved"},
 		"Anthropic-Dangerous-Direct-Browser-Access": {"true"}, "X-App": {"cli"},
 		"X-Stainless-Lang": {"js"}, "X-Stainless-Package-Version": {"0.112.1"},
 		"X-Stainless-Os": {"Linux"}, "X-Stainless-Arch": {"arm64"},
@@ -38,7 +38,5 @@ func TestBackendResponseHeaderBoundary(t *testing.T) {
 		"Request-Id": {"req-123"}, "Retry-After": {"3"}, "Retry-After-Ms": {"250"},
 		"X-Should-Retry": {"false"}, "Anthropic-Ratelimit-Unified-Status": {"allowed"},
 	}
-	if !reflect.DeepEqual(dst, want) {
-		t.Fatalf("response protocol boundary mismatch: %v", dst)
-	}
+	if !reflect.DeepEqual(dst, want) { t.Fatalf("response protocol boundary mismatch: %v", dst) }
 }
