@@ -18,7 +18,7 @@ import (
 
 func startServerWithOpenListener(t *testing.T) (*processCertificate, *Proxy) {
 	t.Helper()
-	certs, err := loadOrCreatePersistentCertificate(filepath.Join(t.TempDir(), "state"), []net.IP{net.IPv4(127, 0, 0, 1)})
+	certs, err := loadOrCreatePersistentCertificate(filepath.Join(canonicalTestTempDir(t), "state"), []net.IP{net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestTheCertificateListenerStillDemandsACertificateBesideTheOpenOne(t *testi
 }
 
 func TestTheOpenListenerRefusesAnythingButLoopback(t *testing.T) {
-	certs, err := loadOrCreatePersistentCertificate(filepath.Join(t.TempDir(), "state"), nil)
+	certs, err := loadOrCreatePersistentCertificate(filepath.Join(canonicalTestTempDir(t), "state"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestConnectOpenInsistsOnLoopbackAndACAFile(t *testing.T) {
 	if code, err := connectOpen(ctx, ConnectOptions{Open: "127.0.0.1:8444"}, nil); err == nil || code != 2 {
 		t.Fatalf("--open without --ca was accepted: %d %v", code, err)
 	}
-	bad := filepath.Join(t.TempDir(), "not-a-ca.pem")
+	bad := filepath.Join(canonicalTestTempDir(t), "not-a-ca.pem")
 	if err := os.WriteFile(bad, []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
