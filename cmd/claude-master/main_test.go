@@ -427,3 +427,17 @@ func canonicalHome(t *testing.T) string {
 	}
 	return dir
 }
+
+// The open (no certificate) listener must never be offered on anything but loopback.
+func TestServeRefusesANonLoopbackOpenListener(t *testing.T) {
+	home := canonicalHome(t)
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	installRunProfileFixture(t, home, "alpha")
+	code, err := run([]string{"serve", "alpha", "--listen", "127.0.0.1:0", "--open-loopback", "10.0.1.50:8444", "--state-dir", filepath.Join(home, "state")})
+	if err == nil || code == 0 {
+		t.Fatalf("a non-loopback --open-loopback returned code %d, error %v", code, err)
+	}
+}
