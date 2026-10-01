@@ -34,9 +34,26 @@ func (a *ClaudeAuthenticator) loginManual(ctx context.Context, cfg *config.Confi
 	}
 
 	fmt.Printf("Open this URL in a browser signed in to the Claude account to use, approve it, then paste the code Claude shows:\n\n%s\n\n", authURL)
-	input, err := opts.Prompt("Paste the code: ")
-	if err != nil {
-		return nil, err
+	// The prompt blocks on stdin, so read it in the background and stay cancellable: Ctrl-C or a
+	// termination signal must end the login (and release the profile lock) without a line of input.
+	type answer struct {
+		text string
+		err  error
+	}
+	answered := make(chan answer, 1)
+	go func() {
+		text, errPrompt := opts.Prompt("Paste the code: ")
+		answered <- answer{text, errPrompt}
+	}()
+	var input string
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case reply := <-answered:
+		if reply.err != nil {
+			return nil, reply.err
+		}
+		input = reply.text
 	}
 	code, gotState, err := splitManualCode(input)
 	if err != nil {

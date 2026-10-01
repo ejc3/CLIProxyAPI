@@ -2,8 +2,10 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
@@ -43,5 +45,27 @@ func TestClaudeManualLoginPrintsManualURLAndRejectsAnotherLoginsCode(t *testing.
 func TestClaudeManualLoginNeedsAPrompt(t *testing.T) {
 	if _, err := NewClaudeAuthenticator().Login(context.Background(), &config.Config{}, &LoginOptions{ManualCode: true}); err == nil {
 		t.Fatal("a manual login with nothing to read the code from must fail")
+	}
+}
+
+func TestClaudeManualLoginStopsWhenCancelledWhilePrompting(t *testing.T) {
+	blocked := make(chan struct{})
+	t.Cleanup(func() { close(blocked) })
+	prompt := func(string) (string, error) { <-blocked; return "", nil } // stdin that never answers
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := NewClaudeAuthenticator().Login(ctx, &config.Config{}, &LoginOptions{ManualCode: true, Prompt: prompt})
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a cancelled login stayed blocked on the prompt")
 	}
 }
