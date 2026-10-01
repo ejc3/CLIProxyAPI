@@ -219,6 +219,9 @@ func newBackend(ctx context.Context, credentials []BackendCredential, modelName 
 	case "claude":
 		executor := newSharedClaudeExecutor(runtimeexecutor.NewClaudeExecutor(cfg), stores)
 		manager.RegisterExecutor(executor)
+		if quotaRequest == nil {
+			quotaRequest = manager.HttpRequest // the default requester, resolved here so the cache wraps it
+		}
 		quotaRequest = sharedUsageRequest(quotaRequest, stores)
 		if seriesSelector != nil {
 			seriesSelector.prepareIdentity = func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {

@@ -93,9 +93,15 @@ func diskAhead(disk, mem map[string]any) bool {
 		credentialString(disk, "refresh_token") == credentialString(mem, "refresh_token") {
 		return false
 	}
-	// Strictly newer: on a tie there is no evidence the file is ahead, and a wrong guess is
-	// corrected by the 401 path (which adopts whatever the file holds).
-	return credentialRevision(disk).After(credentialRevision(mem))
+	diskRevision, memRevision := credentialRevision(disk), credentialRevision(mem)
+	if diskRevision.IsZero() && memRevision.IsZero() {
+		return false // no ordering information at all (an old file): this process's save stands
+	}
+	// A tie between differing token pairs is a conflict, not "disk is not newer": a save from a
+	// process holding the previous pair must never overwrite a pair that was just rotated, because
+	// the old refresh token is dead. Rotations stamp last_refresh at nanosecond precision, so a real
+	// tie is vanishingly rare; when one happens the saved file wins.
+	return !diskRevision.Before(memRevision)
 }
 
 // adoptDiskTokens returns a copy of auth carrying the saved credential's tokens. Everything else
