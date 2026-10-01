@@ -162,7 +162,7 @@ func StartProxy(opts ProxyOptions) (*Proxy, error) {
 		},
 	}
 	baseContext := func(net.Listener) context.Context { return ctx }
-	p.outer = &http.Server{Handler: p.ownedHandler(p.handleConnect), BaseContext: baseContext, ErrorLog: log.New(newHandshakeErrorWriter(nil), "", 0)}
+	p.outer = &http.Server{Handler: p.ownedHandler(p.handleConnect), BaseContext: baseContext, ErrorLog: log.New(newHandshakeErrorWriter(observeHandshakeError), "", 0)}
 	p.inner = &http.Server{
 		Handler: p.ownedHandler(p.handleAPI), BaseContext: baseContext, ErrorLog: log.New(io.Discard, "", 0),
 		// Every request on an inner connection knows which client opened the tunnel.
@@ -187,6 +187,7 @@ func StartProxy(opts ProxyOptions) (*Proxy, error) {
 	}
 	go func() { defer p.wg.Done(); _ = p.inner.Serve(p.innerListen) }()
 	lg().Info("proxy listening", "addr", p.Addr(), "open_loopback_addr", p.openAddr)
+	registerStateSource(p)
 	return p, nil
 }
 
@@ -222,6 +223,7 @@ func (p *Proxy) Snapshot() ProxyStats {
 func (p *Proxy) Close() error {
 	p.closeOnce.Do(func() {
 		lg().Info("proxy stopping")
+		unregisterStateSource(p)
 		p.mu.Lock()
 		p.closed = true
 		p.cancel()
@@ -292,6 +294,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	host, err := proxyAuthority(r.RequestURI)
 	if err != nil || r.Host != r.RequestURI || r.ContentLength > 0 || len(r.TransferEncoding) != 0 {
 		p.counters.connectRejected.Add(1)
+		observeConnection("unknown", "rejected")
 		lg().Debug("CONNECT refused: not an acceptable HTTPS authority")
 		http.Error(w, "invalid CONNECT authority", http.StatusBadRequest)
 		return
@@ -314,6 +317,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	p.counters.connectAccepted.Add(1)
 	clientName, listenerKind := identifyClient(raw)
+	observeConnection(listenerKind, "accepted")
 	if _, seen := p.seen.LoadOrStore(clientName+"|"+listenerKind, true); !seen {
 		lg().Info("client connected for the first time", "client", clientName, "listener", listenerKind)
 	}
@@ -706,3 +710,9 @@ func (listener *proxyListener) Close() error {
 }
 
 func (listener *proxyListener) Addr() net.Addr { return listener.addr }
+
+// metricsState feeds the active-connection gauge.
+func (p *Proxy) metricsState() stateSnapshot {
+	snap := p.Snapshot()
+	return stateSnapshot{ActiveConns: int64(snap.ActiveConnections), HasActiveConns: true}
+}
