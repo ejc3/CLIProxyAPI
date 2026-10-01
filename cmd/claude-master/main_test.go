@@ -405,7 +405,7 @@ func TestOpenRunProfilesReleasesPartialLockSet(t *testing.T) {
 // A server that cannot start must exit non-zero: systemd's Restart=on-failure and any deploy
 // script judge it by the exit status alone.
 func TestServeThatCannotStartExitsNonZero(t *testing.T) {
-	home := t.TempDir()
+	home := canonicalHome(t)
 	if err := os.Chmod(home, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -415,4 +415,15 @@ func TestServeThatCannotStartExitsNonZero(t *testing.T) {
 	if err == nil || code == 0 {
 		t.Fatalf("serve with a public listen address returned code %d, error %v", code, err)
 	}
+}
+
+// canonicalHome is a private temp directory with symlinks resolved: macOS places TempDir below /var,
+// a symlink to /private/var, and profile paths with symlinks are (rightly) refused.
+func canonicalHome(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
