@@ -365,3 +365,35 @@ func TestTheLimiterAllowsOnePerGapPerKey(t *testing.T) {
 		t.Fatal("a stays refused after the gap")
 	}
 }
+
+// A credential file is named after the account's email (claude-<id>-<email>.json). Whatever names a
+// profile in a log or a metric must never be derived from that.
+func TestAProfileWithoutANameIsNeverNamedAfterItsEmailBearingFile(t *testing.T) {
+	const fileName = "claude-54af6cbe-someone@example.com.json"
+	name := safeProfileName("", fileName)
+	if strings.Contains(name, "someone") || strings.Contains(name, "@") || strings.Contains(name, ".") || !strings.HasPrefix(name, "profile-") {
+		t.Fatalf("fallback name %q leaks the file name", name)
+	}
+	if safeProfileName("", fileName) != name || name == safeProfileName("", "claude-other.json") {
+		t.Fatal("the fallback must be stable and tell profiles apart")
+	}
+	if safeProfileName("claude-connor", fileName) != "claude-connor" {
+		t.Fatal("a profile's own name must win")
+	}
+	if safeProfileName("not a name!", "claude-master-3-1") != "claude-master-3-1" {
+		t.Fatal("an internal runtime id is a fine fallback")
+	}
+	logs := captureLogs(t, "debug")
+	selector := &backendSeriesSelector{authIDs: []string{fileName}, provider: "claude"}
+	t.Cleanup(selector.Stop)
+	selector.observeQuota(fileName, backendWeeklyQuota{known: true, used: 0.95, resetsAt: time.Now().Add(time.Hour)})
+	selector.logSnapshot(time.Minute)
+	selector.OnResult(coreauth.Result{AuthID: fileName, Provider: "claude", CredentialScope: true, Error: &coreauth.Error{HTTPStatus: 401}})
+	if out := logs.String(); strings.Contains(out, "someone") || strings.Contains(out, "example.com") || strings.Contains(out, "54af6cbe") {
+		t.Fatalf("a credential file name reached the log:\n%s", out)
+	}
+	store := &backendStore{opts: BackendOptions{AuthID: fileName}}
+	if strings.Contains(store.name(), "someone") {
+		t.Fatalf("a store named itself %q", store.name())
+	}
+}

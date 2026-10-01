@@ -70,6 +70,7 @@ func (e *sharedClaudeExecutor) Refresh(ctx context.Context, auth *coreauth.Auth)
 	}
 	defer unlock()
 	if disk, errDisk := store.diskSnapshot(); errDisk == nil && diskAhead(disk, auth.Metadata) {
+		observeRefresh(store.name(), "adopted")
 		lg().Info("login refresh adopted from another claude-master process", "profile", store.name())
 		return adoptDiskTokens(auth, disk), nil
 	}
@@ -85,6 +86,7 @@ func (e *sharedClaudeExecutor) rotateLocked(ctx context.Context, store *backendS
 	}
 	refreshed, err := rotate(ctx, auth.Clone())
 	if err != nil {
+		observeRefresh(store.name(), "failed")
 		lg().Warn("login refresh failed", "profile", store.name(), "why", why, "reason", refreshFailureReason(err))
 		return nil, err
 	}
@@ -97,6 +99,7 @@ func (e *sharedClaudeExecutor) rotateLocked(ctx context.Context, store *backendS
 		lg().Error("a refreshed login could not be saved", "profile", store.name())
 		return nil, err
 	}
+	observeRefresh(store.name(), "rotated_"+why)
 	lg().Info("login refreshed", "profile", store.name(), "why", why, "expires_in", expiresIn(refreshed.Metadata))
 	return refreshed, nil
 }
@@ -141,6 +144,7 @@ func (e *sharedClaudeExecutor) recoverUnauthorized(ctx context.Context, rejected
 	rejectedToken := credentialString(rejected.Metadata, "access_token")
 	if disk, errDisk := store.diskSnapshot(); errDisk == nil {
 		if saved := credentialString(disk, "access_token"); saved != "" && saved != rejectedToken {
+			observeRefresh(store.name(), "adopted_after_401")
 			lg().Info("adopted a newer login after a 401", "profile", store.name())
 			return adoptDiskTokens(rejected, disk), true
 		}
@@ -276,6 +280,7 @@ func sharedUsageRequest(next ClaudeQuotaRequestFunc, stores []*backendStore) Cla
 		}
 		path := filepath.Clean(store.opts.AuthDir) + ".usage"
 		if body, ok := readUsageCache(path, usageCacheTTL); ok {
+			observeUsagePoll(store.name(), "cache_hit")
 			return &http.Response{
 				StatusCode: http.StatusOK, Status: "200 OK", Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
 				Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(bytes.NewReader(body)),
@@ -332,8 +337,5 @@ func writeUsageCache(path string, body []byte) {
 
 // name is the profile's own name for logs and metrics.
 func (s *backendStore) name() string {
-	if s.opts.Name != "" {
-		return s.opts.Name
-	}
-	return strings.TrimSuffix(s.opts.AuthID, ".json")
+	return safeProfileName(s.opts.Name, s.opts.AuthID)
 }

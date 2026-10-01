@@ -2,11 +2,13 @@ package claudemaster
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"net/http"
+	"regexp"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -32,10 +34,23 @@ type selectorStats struct {
 }
 
 func profileDisplayName(c BackendCredential) string {
-	if c.Name != "" {
-		return c.Name
+	return safeProfileName(c.Name, c.AuthID)
+}
+
+var plainName = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// safeProfileName is a profile's name for logs and metrics. It is the profile's own name when there is
+// one. Otherwise it is NEVER derived from a credential file name: those carry the account's email address
+// (claude-<id>-<email>.json). A fallback is a short hash, which tells profiles apart and nothing else.
+func safeProfileName(name, authID string) string {
+	if plainName.MatchString(name) {
+		return name
 	}
-	return strings.TrimSuffix(c.AuthID, ".json")
+	if plainName.MatchString(authID) {
+		return authID // an internal runtime id such as claude-master-3-1
+	}
+	sum := sha256.Sum256([]byte(authID))
+	return "profile-" + hex.EncodeToString(sum[:3])
 }
 
 func (s *backendSeriesSelector) profileNameLocked(authID string) string {
@@ -48,7 +63,7 @@ func (s *backendSeriesSelector) profileNameLocked(authID string) string {
 	if name := s.names[authID]; name != "" {
 		return name
 	}
-	return authID
+	return safeProfileName("", authID)
 }
 
 func (s *backendSeriesSelector) profileName(authID string) string {
@@ -124,9 +139,11 @@ func (s *backendSeriesSelector) noteSelection(sessionID, model string, picked *c
 	}
 	name := s.profileNameLocked(picked.ID)
 	stats.picks[name]++
-	if picked.ID == s.backupAuthID && s.backupAuthID != "" {
+	isBackup := picked.ID == s.backupAuthID && s.backupAuthID != ""
+	if isBackup {
 		stats.backup++
 	}
+	observePick(name, took, isBackup)
 	lg().Debug("account chosen", "session", sessionTag(sessionID), "model", model, "profile", name, "took", took.Round(time.Microsecond).String())
 }
 
@@ -164,6 +181,7 @@ func (s *backendSeriesSelector) switchReasonLocked(fromID, toID string) string {
 
 func (s *backendSeriesSelector) noteSwitchLocked(sessionID, fromID, toID string) {
 	s.statsLocked().switches++
+	observeSwitch(s.profileNameLocked(fromID), s.profileNameLocked(toID), s.switchReasonLocked(fromID, toID))
 	lg().Info("inference account switched",
 		"session", sessionTag(sessionID),
 		"from", s.profileNameLocked(fromID), "to", s.profileNameLocked(toID),
@@ -209,6 +227,7 @@ func (s *backendSeriesSelector) noteResultLocked(result coreauth.Result, cooldow
 		}
 		s.rateLimited[result.AuthID] = true
 		s.statsLocked().rateLimit++
+		observeRateLimited(name)
 		lg().Info("profile rate limited", "profile", name, "status", status,
 			"cooldown", cooldown.Round(time.Second).String(), "until", until.UTC().Format(time.RFC3339), "retry_after_header", retryAfter)
 		return
@@ -301,7 +320,63 @@ func (s *backendSeriesSelector) noteUsagePoll(authID, why string) {
 	if s.limiter == nil {
 		s.limiter = newEvery(time.Minute)
 	}
+	observeUsagePoll(s.profileNameLocked(authID), "failed")
 	if s.limiter.allow("usage:" + authID) {
 		lg().Warn("subscription usage poll failed", "profile", s.profileNameLocked(authID), "why", why)
 	}
+}
+
+// metricsSnapshot is the selector's live state for the gauges: per profile the weekly quota, any
+// rate-limit cooldown and the login's expiry (read from its saved credential).
+func (s *backendSeriesSelector) metricsSnapshot(stores []*backendStore) stateSnapshot {
+	expiry := make(map[string]float64, len(stores))
+	for _, store := range stores {
+		if disk, err := store.diskSnapshot(); err == nil {
+			if t, errParse := time.Parse(time.RFC3339, credentialString(disk, "expired")); errParse == nil {
+				expiry[store.runtimeID] = time.Until(t).Seconds()
+			}
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snap := stateSnapshot{}
+	if s.stopped {
+		return snap
+	}
+	s.initializeLocked()
+	now := s.nowOrReal()
+	for _, id := range s.authIDs {
+		q := s.currentQuotaLocked(id)
+		p := profileState{Name: s.profileNameLocked(id), Used: q.used, UsedKnown: q.known, Band: -1}
+		switch quotaBand(q) {
+		case "ok":
+			p.Band = 0
+		case "reserve":
+			p.Band = 1
+		case "exhausted":
+			p.Band = 2
+		}
+		if q.known && !q.resetsAt.IsZero() {
+			p.ResetsKnown, p.ResetsInSeconds = true, max(q.resetsAt.Sub(now).Seconds(), 0)
+		}
+		if s.quotaBlockedLocked(id) {
+			p.BlockedSeconds = max(s.quotaBlockedUntil[id].Sub(now).Seconds(), 0)
+		}
+		if v, ok := expiry[id]; ok {
+			p.TokenKnown, p.TokenExpiresIn = true, v
+		}
+		snap.Profiles = append(snap.Profiles, p)
+	}
+	if s.sessions != nil {
+		snap.Sessions = int64(s.sessions.Len())
+	}
+	return snap
+}
+
+// metricsState lets the backend feed the quota gauges.
+func (b *Backend) metricsState() stateSnapshot {
+	if b == nil || b.seriesSelector == nil {
+		return stateSnapshot{}
+	}
+	return b.seriesSelector.metricsSnapshot(b.stores)
 }

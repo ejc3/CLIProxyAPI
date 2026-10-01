@@ -93,6 +93,7 @@ type Backend struct {
 	seriesSelector *backendSeriesSelector
 	quotaPollDone  <-chan struct{}
 	observeDone    <-chan struct{}
+	stores         []*backendStore
 	cancel         context.CancelFunc
 	once           sync.Once
 }
@@ -100,7 +101,7 @@ type Backend struct {
 // NewBackend loads one profile, then starts its account-local refresh loop.
 func NewBackend(ctx context.Context, opts BackendOptions) (*Backend, error) {
 	pinSingle := !(opts.Provider == "claude" && opts.UseRequestModel)
-	return newBackend(ctx, []BackendCredential{{AuthDir: opts.AuthDir, Provider: opts.Provider, AuthID: opts.AuthID}}, opts.Model, opts.UseRequestModel, pinSingle, nil, backendRoutingOptions{modelMap: opts.ModelMap})
+	return newBackend(ctx, []BackendCredential{{AuthDir: opts.AuthDir, Provider: opts.Provider, AuthID: opts.AuthID, Name: opts.Name}}, opts.Model, opts.UseRequestModel, pinSingle, nil, backendRoutingOptions{modelMap: opts.ModelMap})
 }
 
 // NewBackendSeries loads a quota-aware set of profiles. The caller must hold
@@ -262,6 +263,7 @@ func newBackend(ctx context.Context, credentials []BackendCredential, modelName 
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	backend := &Backend{
+		stores:         stores,
 		manager:        manager,
 		store:          store,
 		authIDs:        authIDs,
@@ -284,6 +286,7 @@ func newBackend(ctx context.Context, credentials []BackendCredential, modelName 
 		}
 		lg().Info("inference backend started", "mode", "pool", "profiles", strings.Join(subscriptions, ","), "api_backup", backupAPIKey != "")
 		backend.observeDone = startBackendObservation(runCtx, seriesSelector, routing.snapshotInterval)
+		registerStateSource(backend)
 	} else {
 		lg().Info("inference backend started", "mode", "single", "profile", profileNames[authIDs[0]])
 	}
@@ -304,6 +307,7 @@ func (b *Backend) Close() error {
 		if b.observeDone != nil {
 			<-b.observeDone
 		}
+		unregisterStateSource(b)
 		lg().Info("inference backend stopped")
 		b.manager.StopAutoRefreshAndWait()
 		// StopAutoRefreshAndWait also stops a stoppable selector. Keep the
@@ -1419,7 +1423,16 @@ func classifyBackendError(err error) BackendErrorStage {
 func newBackendHandler(lifetime context.Context, opts BackendOptions, base *handlers.BaseAPIHandler) http.Handler {
 	router := gin.New()
 	dispatch := func(c *gin.Context) {
+		started := time.Now()
+		metered := newMeteredWriter(c.Writer)
+		c.Writer = metered
+		var raw []byte
+		var model string
+		var isCount, isStream bool
 		ctx, cancel := context.WithCancel(c.Request.Context())
+		// Registered first, so it runs LAST: after the request's own cleanup the chosen account and the
+		// upstream headers are final.
+		defer func() { finishRequest(c, ctx, opts, metered, started, raw, model, isCount, isStream) }()
 		ctx = withBackendAttempt(ctx)
 		ctx = coreexecutor.WithNativeClaudeUpstreamSuccessCallback(ctx, commitBackendRouteAttempt)
 		ctx = coreexecutor.WithNativeClaudeResponseStatusHolder(ctx)
@@ -1445,6 +1458,7 @@ func newBackendHandler(lifetime context.Context, opts BackendOptions, base *hand
 		}
 		ctx = context.WithValue(ctx, "gin", c)
 		if c.Request.URL.Path == "/v1/messages/count_tokens" {
+			isCount = true
 			backendSetCountRequest(ctx)
 			if opts.UseRequestModel {
 				response, errMsg := base.CountProtocolWithAuthManager(ctx, backendProtocolRequest(model, raw, false))
@@ -1466,6 +1480,7 @@ func newBackendHandler(lifetime context.Context, opts BackendOptions, base *hand
 			Stream bool `json:"stream"`
 		}
 		_ = json.Unmarshal(raw, &envelope)
+		isStream = envelope.Stream
 		if envelope.Stream {
 			streamBackendResponse(ctx, c.Writer, base, model, raw, opts.UseRequestModel)
 			return
