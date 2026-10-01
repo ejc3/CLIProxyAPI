@@ -88,6 +88,9 @@ type Proxy struct {
 	wg          sync.WaitGroup
 	closeOnce   sync.Once
 	counters    proxyCounters
+
+	clients sync.Map // inner *tls.Conn -> the client's name (see proxy_observe.go)
+	seen    sync.Map // client name -> first connection logged
 }
 
 // StartProxy binds an ephemeral IPv4 loopback port. It never reads account
@@ -159,8 +162,22 @@ func StartProxy(opts ProxyOptions) (*Proxy, error) {
 		},
 	}
 	baseContext := func(net.Listener) context.Context { return ctx }
-	p.outer = &http.Server{Handler: p.ownedHandler(p.handleConnect), BaseContext: baseContext, ErrorLog: log.New(io.Discard, "", 0)}
-	p.inner = &http.Server{Handler: p.ownedHandler(p.handleAPI), BaseContext: baseContext, ErrorLog: log.New(io.Discard, "", 0)}
+	p.outer = &http.Server{Handler: p.ownedHandler(p.handleConnect), BaseContext: baseContext, ErrorLog: log.New(newHandshakeErrorWriter(nil), "", 0)}
+	p.inner = &http.Server{
+		Handler: p.ownedHandler(p.handleAPI), BaseContext: baseContext, ErrorLog: log.New(io.Discard, "", 0),
+		// Every request on an inner connection knows which client opened the tunnel.
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if name, ok := p.clients.Load(c); ok {
+				return context.WithValue(ctx, clientCtxKey{}, name)
+			}
+			return ctx
+		},
+		ConnState: func(c net.Conn, state http.ConnState) {
+			if state == http.StateClosed || state == http.StateHijacked {
+				p.clients.Delete(c)
+			}
+		},
+	}
 	p.wg.Add(2)
 	go func() { defer p.wg.Done(); _ = p.outer.Serve(listener) }()
 	if openListener != nil {
@@ -169,6 +186,7 @@ func StartProxy(opts ProxyOptions) (*Proxy, error) {
 		go func() { defer p.wg.Done(); _ = p.outer.Serve(openListener) }()
 	}
 	go func() { defer p.wg.Done(); _ = p.inner.Serve(p.innerListen) }()
+	lg().Info("proxy listening", "addr", p.Addr(), "open_loopback_addr", p.openAddr)
 	return p, nil
 }
 
@@ -203,6 +221,7 @@ func (p *Proxy) Snapshot() ProxyStats {
 // It is safe to call concurrently or more than once.
 func (p *Proxy) Close() error {
 	p.closeOnce.Do(func() {
+		lg().Info("proxy stopping")
 		p.mu.Lock()
 		p.closed = true
 		p.cancel()
@@ -273,6 +292,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	host, err := proxyAuthority(r.RequestURI)
 	if err != nil || r.Host != r.RequestURI || r.ContentLength > 0 || len(r.TransferEncoding) != 0 {
 		p.counters.connectRejected.Add(1)
+		lg().Debug("CONNECT refused: not an acceptable HTTPS authority")
 		http.Error(w, "invalid CONNECT authority", http.StatusBadRequest)
 		return
 	}
@@ -293,6 +313,11 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.counters.connectAccepted.Add(1)
+	clientName, listenerKind := identifyClient(raw)
+	if _, seen := p.seen.LoadOrStore(clientName+"|"+listenerKind, true); !seen {
+		lg().Info("client connected for the first time", "client", clientName, "listener", listenerKind)
+	}
+	lg().Debug("client tunnel", "client", clientName, "listener", listenerKind, "host", host)
 	// Read any TLS ClientHello bytes pipelined with CONNECT before reading the
 	// raw socket. The bytes must go through TLS, not into decrypted HTTP.
 	stream := &proxyBufferedConn{Conn: client, reader: buffered.Reader}
@@ -306,6 +331,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		tlsConn := tls.Server(stream, p.tlsConfig)
+		p.clients.Store(tlsConn, clientName)
 		select {
 		case p.innerListen.connections <- tlsConn:
 		case <-p.ctx.Done():

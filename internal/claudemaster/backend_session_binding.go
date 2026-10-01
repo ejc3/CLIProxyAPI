@@ -86,7 +86,12 @@ func (s *backendSeriesSelector) bindSessionOriginLocked(ctx context.Context, ses
 		}
 		recordBackendRouteAttempt(ctx, s, sessionID, auth.ID, route)
 	}
+	previousID, hadPrevious := "", false
+	if s.sessions != nil {
+		previousID, hadPrevious = s.sessions.Get(sessionID)
+	}
 	s.sessions.Set(sessionID, auth.ID)
+	s.noteBoundLocked(sessionID, previousID, hadPrevious, auth)
 	return auth, nil
 }
 
