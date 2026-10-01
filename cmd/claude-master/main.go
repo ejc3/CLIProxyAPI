@@ -174,7 +174,7 @@ func run(args []string) (int, error) {
 	var nextProfiles stringListFlag
 	var backupAPIKeySource string
 	var modelMap modelMapFlag
-	var listen, stateDir string
+	var listen, stateDir, openLoopback string
 	switch command {
 	case "serve":
 		flags.Var(&nextProfiles, "next-profile", "additional inference profile for quota-aware subscription rotation")
@@ -182,6 +182,7 @@ func run(args []string) (int, error) {
 		flags.Var(&modelMap, "map", "exact model mapping INCOMING:TARGET (repeatable)")
 		flags.StringVar(&listen, "listen", "", "private ADDRESS:PORT to serve client boxes on")
 		flags.StringVar(&stateDir, "state-dir", "", "private directory holding the server's CA")
+		flags.StringVar(&openLoopback, "open-loopback", "", "also serve plain HTTP with NO client certificate on this loopback ADDRESS:PORT, for an authenticating tunnel")
 	case "probe":
 		flags.StringVar(&model, "model", "", "diagnostic model")
 	case "run":
@@ -243,7 +244,7 @@ func run(args []string) (int, error) {
 		// success and never restart it.
 		if err := claudemaster.Serve(ctx, profiles, claudemaster.ServeOptions{
 			LaunchOptions: claudemaster.LaunchOptions{BackupAPIKey: backupAPIKey, BackupAPIKeyEnv: consumedKeyEnv, ModelMap: modelMap},
-			Listen:        listen, StateDir: stateDir, Out: os.Stderr,
+			Listen:        listen, StateDir: stateDir, OpenLoopback: openLoopback, Out: os.Stderr,
 		}); err != nil {
 			return 1, err
 		}
@@ -391,11 +392,13 @@ func runIssue(args []string) (int, error) {
 func runConnect(ctx context.Context, args []string) (int, error) {
 	flags := flag.NewFlagSet("connect", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	var server, dir string
+	var server, dir, open, caFile string
 	flags.StringVar(&server, "server", os.Getenv("CLAUDE_MASTER_SERVER"), "the server's private ADDRESS:PORT")
 	flags.StringVar(&dir, "dir", os.Getenv("CLAUDE_MASTER_CLIENT_DIR"), "this box's client directory")
-	if err := flags.Parse(args); err != nil || server == "" || dir == "" {
-		return 2, errors.New("usage: claude-master connect --server ADDRESS:PORT --dir DIR -- [Claude arguments] (or set CLAUDE_MASTER_SERVER and CLAUDE_MASTER_CLIENT_DIR)")
+	flags.StringVar(&open, "open", os.Getenv("CLAUDE_MASTER_OPEN"), "loopback ADDRESS:PORT of an authenticating tunnel to the server's open listener (no client certificate)")
+	flags.StringVar(&caFile, "ca", os.Getenv("CLAUDE_MASTER_CA"), "the server's public ca.pem (with --open)")
+	if err := flags.Parse(args); err != nil || (open == "" && (server == "" || dir == "")) {
+		return 2, errors.New("usage: claude-master connect --server ADDRESS:PORT --dir DIR -- [Claude arguments]; or claude-master connect --open 127.0.0.1:PORT --ca FILE -- [Claude arguments] (defaults from CLAUDE_MASTER_SERVER, CLAUDE_MASTER_CLIENT_DIR, CLAUDE_MASTER_OPEN, CLAUDE_MASTER_CA)")
 	}
-	return claudemaster.Connect(ctx, claudemaster.ConnectOptions{Server: server, Dir: dir, Out: os.Stderr}, flags.Args())
+	return claudemaster.Connect(ctx, claudemaster.ConnectOptions{Server: server, Dir: dir, Open: open, CAFile: caFile, Out: os.Stderr}, flags.Args())
 }
