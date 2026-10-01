@@ -24,7 +24,7 @@ import (
 // issueTestClient runs the real client-init / issue sequence and returns the client's directory.
 func issueTestClient(t *testing.T, stateDir, name string, days int) string {
 	t.Helper()
-	dir := filepath.Join(t.TempDir(), "client")
+	dir := filepath.Join(canonicalTestTempDir(t), "client")
 	request, err := CreateClientRequest(dir, name)
 	if err != nil {
 		t.Fatal(err)
@@ -48,7 +48,7 @@ func issueTestClient(t *testing.T, stateDir, name string, days int) string {
 
 func newTestServer(t *testing.T) (stateDir string, certs *processCertificate, proxy *Proxy) {
 	t.Helper()
-	stateDir = filepath.Join(t.TempDir(), "state")
+	stateDir = filepath.Join(canonicalTestTempDir(t), "state")
 	var err error
 	certs, err = loadOrCreatePersistentCertificate(stateDir, []net.IP{net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -117,7 +117,7 @@ func TestServerAcceptsAnIssuedClientAndRefusesEverythingElse(t *testing.T) {
 }
 
 func TestIssuedCertificatesAreShortLivedNamedAndNeverCarryTheKey(t *testing.T) {
-	stateDir := filepath.Join(t.TempDir(), "state")
+	stateDir := filepath.Join(canonicalTestTempDir(t), "state")
 	dir := issueTestClient(t, stateDir, "dev-box-1", 30)
 	identity, err := LoadClientIdentity(dir)
 	if err != nil {
@@ -140,15 +140,15 @@ func TestIssuedCertificatesAreShortLivedNamedAndNeverCarryTheKey(t *testing.T) {
 		t.Fatal("an existing client key was overwritten")
 	}
 	for _, name := range []string{"", "Upper", "has space", "-lead", strings.Repeat("a", 64), "a/b"} {
-		if _, err := CreateClientRequest(filepath.Join(t.TempDir(), "x"), name); err == nil {
+		if _, err := CreateClientRequest(filepath.Join(canonicalTestTempDir(t), "x"), name); err == nil {
 			t.Fatalf("name %q accepted", name)
 		}
 	}
 }
 
 func TestSignerRefusesATamperedRequest(t *testing.T) {
-	stateDir := filepath.Join(t.TempDir(), "state")
-	dir := filepath.Join(t.TempDir(), "client")
+	stateDir := filepath.Join(canonicalTestTempDir(t), "state")
+	dir := filepath.Join(canonicalTestTempDir(t), "client")
 	path, err := CreateClientRequest(dir, "dev-box-1")
 	if err != nil {
 		t.Fatal(err)
@@ -171,7 +171,7 @@ func TestSignerRefusesATamperedRequest(t *testing.T) {
 }
 
 func TestPersistentCAIsReloadedAndNameConstrained(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "state")
+	dir := filepath.Join(canonicalTestTempDir(t), "state")
 	first, err := loadOrCreatePersistentCertificate(dir, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -257,9 +257,9 @@ func TestConnectReportsAServerItCannotUse(t *testing.T) {
 }
 
 func TestClientIdentityRejectsAnExpiredOrForeignCertificate(t *testing.T) {
-	stateDir := filepath.Join(t.TempDir(), "state")
+	stateDir := filepath.Join(canonicalTestTempDir(t), "state")
 	dir := issueTestClient(t, stateDir, "dev-box-1", 30)
-	foreignState := filepath.Join(t.TempDir(), "state")
+	foreignState := filepath.Join(canonicalTestTempDir(t), "state")
 	foreign := issueTestClient(t, foreignState, "dev-box-1", 30)
 	data, _ := os.ReadFile(filepath.Join(foreign, persistentCAFile))
 	if err := os.WriteFile(filepath.Join(dir, persistentCAFile), data, 0o644); err != nil { // trust the wrong CA
@@ -278,7 +278,7 @@ func TestClientIdentityRejectsAnExpiredOrForeignCertificate(t *testing.T) {
 
 func TestServerCertificateNamesLoopbackSoATunnelClientCanVerifyIt(t *testing.T) {
 	names := serverNames(net.ParseIP("10.0.1.50"))
-	dir := filepath.Join(t.TempDir(), "state")
+	dir := filepath.Join(canonicalTestTempDir(t), "state")
 	certs, err := loadOrCreatePersistentCertificate(dir, names)
 	if err != nil {
 		t.Fatal(err)
@@ -310,7 +310,7 @@ func TestConnectReportsAClientCertificateTheServerDoesNotAccept(t *testing.T) {
 		t.Fatal(err)
 	}
 	otherPool := x509.NewCertPool()
-	otherCerts, err := loadOrCreatePersistentCertificate(filepath.Join(t.TempDir(), "other"), nil)
+	otherCerts, err := loadOrCreatePersistentCertificate(filepath.Join(canonicalTestTempDir(t), "other"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
