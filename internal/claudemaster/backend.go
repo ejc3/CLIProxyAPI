@@ -217,8 +217,9 @@ func newBackend(ctx context.Context, credentials []BackendCredential, modelName 
 	}
 	switch provider {
 	case "claude":
-		executor := runtimeexecutor.NewClaudeExecutor(cfg)
+		executor := newSharedClaudeExecutor(runtimeexecutor.NewClaudeExecutor(cfg), stores)
 		manager.RegisterExecutor(executor)
+		quotaRequest = sharedUsageRequest(quotaRequest, stores)
 		if seriesSelector != nil {
 			seriesSelector.prepareIdentity = func(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
 				prepareCtx, cancelPrepare := context.WithTimeout(ctx, claudeQuotaDefaultTimeout)
@@ -353,6 +354,7 @@ type backendStore struct {
 	path       string
 	runtimeID  string
 	renameFile func(string, string) error
+	view       diskView
 }
 
 func loadBackendCredential(ctx context.Context, opts BackendOptions) (*backendStore, *coreauth.Auth, error) {
@@ -371,6 +373,11 @@ func loadBackendCredentialAs(ctx context.Context, opts BackendOptions, runtimeID
 	if err != nil || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
 		return nil, nil, errors.New("inference auth directory must be private and not a symlink")
 	}
+	unlockRefresh, err := lockRefresh(ctx, opts.AuthDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer unlockRefresh()
 	if err := recoverStagedRefresh(opts.AuthDir, opts.AuthID, opts.Provider); err != nil {
 		return nil, nil, err
 	}
@@ -433,8 +440,6 @@ func (s *backendStore) validate(auth *coreauth.Auth) error {
 }
 
 func (s *backendStore) List(ctx context.Context) ([]*coreauth.Auth, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	_, auth, err := loadBackendCredentialAs(ctx, s.opts, s.runtimeID)
 	if err != nil {
 		return nil, err
@@ -442,7 +447,27 @@ func (s *backendStore) List(ctx context.Context) ([]*coreauth.Auth, error) {
 	return []*coreauth.Auth{auth}, nil
 }
 
-func (s *backendStore) Save(_ context.Context, auth *coreauth.Auth) (string, error) {
+// Save persists a credential. A rotation that already happened must reach disk even if the request
+// that caused it was canceled, so the lock wait ignores cancellation.
+func (s *backendStore) Save(ctx context.Context, auth *coreauth.Auth) (string, error) {
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed { // a late result after shutdown must not touch the profile directory again
+		return "", errors.New("inference credential store is closed")
+	}
+	unlock, err := lockRefresh(context.WithoutCancel(ctx), s.opts.AuthDir)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	return s.saveLocked(auth)
+}
+
+// saveLocked writes under the profile's refresh lock. It never replaces newer tokens on disk with
+// older ones: if another process rotated the login, its tokens win and only this process's other
+// fields are merged in.
+func (s *backendStore) saveLocked(auth *coreauth.Auth) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -479,9 +504,22 @@ func (s *backendStore) Save(_ context.Context, auth *coreauth.Auth) (string, err
 	metadata["disable_cooling"] = false
 	delete(metadata, "disable-cooling")
 	metadata["disabled"] = auth.Disabled
+	disk, errDisk := readRefreshSnapshot(s.path)
+	if errDisk == nil && diskAhead(disk, metadata) {
+		for _, key := range credentialTokenKeys {
+			if value, ok := disk[key]; ok {
+				metadata[key] = value
+			}
+		}
+	}
 	raw, err := json.Marshal(metadata)
 	if err != nil {
 		return "", errors.New("cannot serialize refreshed inference credential")
+	}
+	if errDisk == nil {
+		if onDisk, errMarshal := json.Marshal(disk); errMarshal == nil && bytes.Equal(onDisk, raw) {
+			return s.path, nil // the saved file already says exactly this
+		}
 	}
 	// Once OAuth has rotated a token, finish its durable write even if the
 	// request context was canceled. Backend.Close joins the refresh workers
