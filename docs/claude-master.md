@@ -295,9 +295,12 @@ later request.
   The kernel releases the lock when its holder dies, so a crashed launcher cannot wedge the rest.
   Conversation routing records are one file per session and need no coordination. A Codex profile
   keeps the old rule of one launcher at a time.
-- The local CONNECT proxy uses a random process-only credential. Its temporary CA is
-  trusted only by the child through `NODE_EXTRA_CA_CERTS`; it is not installed in the
-  system trust store. Leaf certificates renew on new handshakes without interrupting
+- The local proxy is an HTTPS listener that requires a client certificate; there is no password.
+  A launch makes a throwaway CA and one client certificate for its own Claude child, passed
+  through `CLAUDE_CODE_CLIENT_CERT` / `CLAUDE_CODE_CLIENT_KEY`. The CA is trusted only by the
+  child through `NODE_EXTRA_CA_CERTS`; it is not installed in the system trust store. The CA is
+  constrained to the DNS name `api.anthropic.com`. It carries no IP-range constraint, because
+  Claude's TLS stack rejects a trusted CA that has one (`unsupported name constraint type`). Leaf certificates renew on new handshakes without interrupting
   existing streams, so a long-running launcher does not lose TLS after a week.
 - Only `api.anthropic.com` is TLS-terminated. Other HTTPS destinations are blind
   tunnels. This is routing isolation, not an operating-system network sandbox.
@@ -360,3 +363,37 @@ scheduling infrastructure. The process-scoped interception design follows
 [remote-claw](https://github.com/ejc3/remote-claw): retain native Claude's control
 plane and intercept only the intended inference traffic. It does not modify the Claude
 binary.
+
+
+## Shared server
+
+One box can hold the subscription logins and serve every other box, so client boxes hold no
+login at all. Clients authenticate with a client certificate the server issued; no password
+exists anywhere.
+
+```bash
+# on the server (profiles are shared, so this can run beside local launches)
+claude-master serve claude-connor --next-profile claude-ejc3 --next-profile claude-colton \
+  --listen 10.0.1.50:8443 --state-dir /var/lib/claude-master
+
+# on a new client box: make its key (never leaves the box) and a request
+claude-master client-init --dir ~/.config/claude-master --name dev-box-1
+
+# on the server: sign it (at most 90 days), then copy client.pem and the server's ca.pem back
+claude-master issue --state-dir /var/lib/claude-master --request client.csr --days 30 --out client.pem
+
+# on the client box
+claude-master connect --server 10.0.1.50:8443 --dir ~/.config/claude-master -- --remote-control
+```
+
+- `--listen` must be a specific loopback or private address. A public bind is refused.
+- The server's CA is created once in `--state-dir` and reloaded on every start, so issued
+  certificates keep working across restarts. A state directory with only half of the CA is an
+  error, not a silent new CA.
+- Issued certificates are short-lived (default 30 days, at most 90), so a lost box expires on its
+  own. `connect` warns when its certificate has under three days left.
+- `connect` holds no profile and never falls back to the box's own login: it makes one TLS
+  handshake with the server first and names the problem if the server is down or does not accept
+  the certificate. `CLAUDE_MASTER_SERVER` and `CLAUDE_MASTER_CLIENT_DIR` supply the defaults.
+- The server accepts `CONNECT` only from a certificate-bearing client, and terminates TLS only
+  for `api.anthropic.com`, exactly as a local launch does.
