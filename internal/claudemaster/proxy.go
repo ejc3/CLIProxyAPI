@@ -288,6 +288,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != http.MethodConnect {
 		p.counters.connectRejected.Add(1)
+		observeConnection("unknown", "rejected")
 		http.Error(w, "proxy expects HTTPS CONNECT", http.StatusBadRequest)
 		return
 	}
@@ -302,17 +303,20 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		p.counters.connectRejected.Add(1)
+		observeConnection("unknown", "rejected")
 		http.Error(w, "CONNECT unavailable", http.StatusInternalServerError)
 		return
 	}
 	raw, buffered, err := hijacker.Hijack()
 	if err != nil {
 		p.counters.connectRejected.Add(1)
+		observeConnection("unknown", "rejected")
 		return
 	}
 	client := p.track(raw)
 	if client == nil {
 		p.counters.connectRejected.Add(1)
+		observeConnection("unknown", "rejected")
 		return
 	}
 	p.counters.connectAccepted.Add(1)

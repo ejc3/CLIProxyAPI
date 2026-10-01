@@ -6,13 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // claude-master's own log. It is deliberately separate from the upstream SDK's logrus output, which
@@ -28,16 +29,51 @@ import (
 // refreshed or rejected, the API-key backup was used, a client was refused; plus a quota snapshot every
 // few minutes. debug adds every routing decision and request. warn and error are for faults.
 
-var discardLogger = slog.New(slog.DiscardHandler)
+// A PRIVATE logrus logger: the global one stays discarded (see above), and this one writes only what this
+// package chooses to say. logger is the small message-and-pairs shape every call site uses.
+type logger struct{ l *log.Logger }
 
-var activeLogger atomic.Pointer[slog.Logger]
+var discardLogger = &logger{}
 
-func lg() *slog.Logger {
-	if l := activeLogger.Load(); l != nil {
-		return l
+var activeLogger atomic.Pointer[logger]
+
+func lg() *logger {
+	if g := activeLogger.Load(); g != nil {
+		return g
 	}
 	return discardLogger
 }
+
+func (g *logger) log(level log.Level, msg string, kv []any) {
+	if g == nil || g.l == nil || !g.l.IsLevelEnabled(level) {
+		return
+	}
+	fields := make(log.Fields, len(kv)/2)
+	for i := 0; i+1 < len(kv); i += 2 {
+		key, ok := kv[i].(string)
+		if !ok {
+			key = fmt.Sprint(kv[i])
+		}
+		fields[key] = redactField(key, kv[i+1])
+	}
+	g.l.WithFields(fields).Log(level, msg)
+}
+
+func (g *logger) Debug(msg string, kv ...any) { g.log(log.DebugLevel, msg, kv) }
+func (g *logger) Info(msg string, kv ...any)  { g.log(log.InfoLevel, msg, kv) }
+func (g *logger) Warn(msg string, kv ...any)  { g.log(log.WarnLevel, msg, kv) }
+func (g *logger) Error(msg string, kv ...any) { g.log(log.ErrorLevel, msg, kv) }
+
+// utcHook stamps every line in UTC, whatever the box's zone.
+type utcHook struct{}
+
+func (utcHook) Levels() []log.Level { return log.AllLevels }
+func (utcHook) Fire(e *log.Entry) error {
+	e.Time = e.Time.UTC()
+	return nil
+}
+
+const logTimeFormat = "2006-01-02T15:04:05.000Z07:00"
 
 // LogOptions configures claude-master's own logging.
 type LogOptions struct {
@@ -83,34 +119,36 @@ func ConfigureLogging(opts LogOptions) (func(), error) {
 	if out == nil {
 		return nil, errors.New("logging needs a file or an output")
 	}
-	handlerOpts := &slog.HandlerOptions{Level: *level, ReplaceAttr: redactAttr}
-	var handler slog.Handler
+	l := log.New()
+	l.SetOutput(out)
+	l.SetLevel(*level)
+	l.AddHook(utcHook{})
 	switch strings.ToLower(opts.Format) {
 	case "", "text":
-		handler = slog.NewTextHandler(out, handlerOpts)
+		l.SetFormatter(&log.TextFormatter{DisableColors: true, FullTimestamp: true, TimestampFormat: logTimeFormat})
 	case "json":
-		handler = slog.NewJSONHandler(out, handlerOpts)
+		l.SetFormatter(&log.JSONFormatter{TimestampFormat: logTimeFormat})
 	default:
 		return nil, errors.New("log format must be text or json")
 	}
-	activeLogger.Store(slog.New(handler))
+	activeLogger.Store(&logger{l: l})
 	return closeFn, nil
 }
 
 // ParseLogLevel returns nil for "off".
-func ParseLogLevel(name string) (*slog.Level, error) {
-	var level slog.Level
+func ParseLogLevel(name string) (*log.Level, error) {
+	var level log.Level
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "off", "none":
 		return nil, nil
 	case "debug":
-		level = slog.LevelDebug
+		level = log.DebugLevel
 	case "", "info":
-		level = slog.LevelInfo
+		level = log.InfoLevel
 	case "warn", "warning":
-		level = slog.LevelWarn
+		level = log.WarnLevel
 	case "error":
-		level = slog.LevelError
+		level = log.ErrorLevel
 	default:
 		return nil, errors.New("log level must be debug, info, warn, error or off")
 	}
@@ -122,20 +160,15 @@ var (
 	secretValue = regexp.MustCompile(`(sk-ant-[A-Za-z0-9_-]{6,}|eyJ[A-Za-z0-9_-]{10,}|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{8,})`)
 )
 
-// redactAttr drops attributes that are named like secrets and masks values that look like one.
-func redactAttr(_ []string, a slog.Attr) slog.Attr {
-	if a.Key == slog.TimeKey || a.Key == slog.LevelKey || a.Key == slog.MessageKey {
-		return a
+// redactField drops values of fields named like secrets and masks values that look like one.
+func redactField(key string, v any) any {
+	if secretKey.MatchString(key) {
+		return "[redacted]"
 	}
-	if secretKey.MatchString(a.Key) {
-		return slog.String(a.Key, "[redacted]")
+	if str, ok := v.(string); ok && secretValue.MatchString(str) {
+		return secretValue.ReplaceAllString(str, "[redacted]")
 	}
-	if a.Value.Kind() == slog.KindString {
-		if v := a.Value.String(); secretValue.MatchString(v) {
-			return slog.String(a.Key, secretValue.ReplaceAllString(v, "[redacted]"))
-		}
-	}
-	return a
+	return v
 }
 
 // ---------------------------------------------------------------- rotation
