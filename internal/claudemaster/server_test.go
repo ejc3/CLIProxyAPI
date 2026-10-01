@@ -275,3 +275,26 @@ func TestClientIdentityRejectsAnExpiredOrForeignCertificate(t *testing.T) {
 		t.Fatalf("a missing certificate must name the file to fetch: %v", err)
 	}
 }
+
+func TestServerCertificateNamesLoopbackSoATunnelClientCanVerifyIt(t *testing.T) {
+	names := serverNames(net.ParseIP("10.0.0.10"))
+	dir := filepath.Join(t.TempDir(), "state")
+	certs, err := loadOrCreatePersistentCertificate(dir, names)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := certs.proxyServerCertificate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(certs.ca)
+	for _, ip := range []string{"10.0.0.10", "127.0.0.1"} {
+		if _, err := leaf.Leaf.Verify(x509.VerifyOptions{Roots: roots, DNSName: ip, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+			t.Errorf("the server certificate does not verify for %s: %v", ip, err)
+		}
+	}
+	if got := serverNames(net.ParseIP("127.0.0.1")); len(got) != 1 {
+		t.Errorf("a loopback listener listed loopback twice: %v", got)
+	}
+}
