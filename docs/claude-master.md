@@ -425,3 +425,92 @@ claude-master connect --open 127.0.0.1:8444 --ca ca.pem -- --remote-control
 - **A tunnel that is down is reported clearly** (nothing listening, or not a claude-master proxy)
   instead of as a hang inside Claude.
 - Defaults come from `CLAUDE_MASTER_OPEN` and `CLAUDE_MASTER_CA`.
+
+## Logging
+
+claude-master has its own log, separate from the upstream SDK's output (which stays discarded: it can carry
+credential paths and upstream response text). `serve` logs at **info** to stderr by default; `run` logs
+nothing unless asked (its stderr is Claude's terminal), and then only to a file.
+
+```bash
+claude-master serve ... --log-level info --log-file /var/log/claude-master/claude-master.log --log-max-mb 20 --log-keep 10
+claude-master run PROFILE --log-level debug --log-file ~/claude-master.log -- ...
+```
+
+`--log-level debug|info|warn|error|off`, `--log-format text|json`, `--quota-log-interval 5m` (a negative value
+turns the snapshot off). A log file rotates by size (`file` becomes `file.1`, `file.1` becomes `file.2`, up to
+`--log-keep`; the oldest is removed) and is `0600`.
+
+**What is never logged:** tokens, request or response bodies, URLs, account identifiers (emails, UUIDs) or
+upstream error text. Logs carry profile names (your own labels), a hashed conversation tag (`s-xxxxxxxx`),
+model names, status codes, durations, counts, quota fractions and client certificate names. A redaction filter
+backs that discipline up by masking secret-shaped keys and values.
+
+| level | event |
+|---|---|
+| info | `inference account switched` (conversation moved: `from`, `to`, `reason` = `reserve_reached`, `weekly_exhausted`, `rate_limited`, `rebalanced`, `subscriptions_exhausted`, `subscription_capacity_returned`) |
+| info | `profile rate limited` / `profile available again`; `quota band changed` (`ok` / `reserve` at 90% / `exhausted`) |
+| info | `login refreshed`, `login refresh adopted from another claude-master process`, `adopted a newer login after a 401` |
+| info | `quota` per profile and `routing summary` (requests per profile, switches, backup picks, refusals) every 5 minutes; `proxy summary` (connections, requests, active) every 5 minutes |
+| info | `client connected for the first time` (certificate name, or `tunnel`), `proxy listening`, `inference backend started` |
+| warn | `using the paid API-key backup` (once a minute), `no inference account could be chosen`, `profile credential rejected by Anthropic` (401/403: the login may need redoing), `Anthropic server error`, `login refresh failed`, `subscription usage poll failed`, `client TLS handshake failed` (once a minute per remote address) |
+| debug | every routing decision (`account chosen`), `conversation bound`, every quota observation, each client tunnel |
+
+## Metrics (OpenTelemetry)
+
+`serve` and `run` can export metrics over OTLP/HTTP to anything that accepts it (a CloudWatch agent, an
+OpenTelemetry Collector): `--otlp-endpoint http://127.0.0.1:4318 --otlp-interval 30s`. Nothing in claude-master
+is specific to a cloud.
+
+```bash
+# which dashboard key is which Anthropic account? (the account id is never exported, only this key)
+claude-master account-key 11111111-2222-3333-4444-555555555555     # -> acct-666ff6cc
+# give an account a readable name in every dashboard
+claude-master serve ... --account-label 11111111-2222-3333-4444-555555555555=colton --account-labels-file labels.txt
+```
+
+**Dimensions.** `profile` (the subscription profile's own name, or `api-backup`), `client` (the connecting box's
+certificate name, `tunnel` on the open listener), **`client_account`** (the INCOMING user's Anthropic account: your
+label, else `acct-` and 8 hex of a hash; `unknown` when the request has none), `model`, `status_class`, `status`,
+`stream`, `route`, `reason`, `result`, `window`, `measure`. A profile with no name is shown as a short hash, never
+from its credential file name (those carry the account's email address).
+
+| metric | kind | what it answers |
+|---|---|---|
+| `claude_master.inference.requests` {profile, client_account, status_class} | counter | which subscription served which user, and how it went |
+| `claude_master.inference.requests.by_model` {model, status_class} | counter | traffic by model |
+| `claude_master.inference.requests.by_client` {client, client_account} | counter | which box (certificate name) carries which user's traffic |
+| `claude_master.inference.duration`, `.ttfb`, `.upstream_ttfb` {profile, status_class} | histogram ms | how fast: whole request, first byte, and Anthropic's own time to first byte |
+| `claude_master.inference.duration.by_model`, `.ttfb.by_model` {model} | histogram ms | latency by model |
+| `claude_master.proxy.overhead` {profile} | histogram ms | claude-master's own added time (request in to account chosen) |
+| `claude_master.inference.duration_quantile` {profile, quantile 0.5/0.95/0.99} | gauge ms | recent p50/p95/p99, so CloudWatch can chart percentiles |
+| `claude_master.inference.errors` {profile, status, client_account} | counter | Anthropic errors by status |
+| `claude_master.inference.request_bytes`, `.response_bytes` {profile} | histogram | sizes |
+| `claude_master.quota.used_fraction`, `.resets_in_seconds`, `.rate_limited_for_seconds`, `.band` {profile} | gauge | each subscription's weekly allowance, when it resets, any cooldown, band (0 ok, 1 reserve, 2 exhausted, -1 unknown) |
+| `claude_master.anthropic.ratelimit` {profile, window, measure} | gauge | EVERY `Anthropic-Ratelimit-*` header: windows `5h`, `7d`, `api`; measures `utilization`, `resets_in_seconds`, `remaining`, `limit` ... |
+| `claude_master.anthropic.ratelimit.state` {profile, window, measure, value} | counter | status words: `allowed`, `allowed_warning`, `rejected` |
+| `claude_master.routing.picks` {profile}, `.switches` {from, to, reason}, `.backup_requests`, `.pick_duration` | counter / histogram | routing and failover |
+| `claude_master.quota.rate_limited` {profile} | counter | times Anthropic rate limited a profile |
+| `claude_master.auth.refresh` {profile, result}, `claude_master.auth.token_expires_in_seconds` {profile} | counter / gauge | login health |
+| `claude_master.usage.polls` {profile, result} | counter | usage polls: `ok`, `failed`, `cache_hit` |
+| `claude_master.proxy.connections` {listener, result}, `.active_connections`, `.tls_handshake_errors` | counter / gauge | clients and refused clients |
+| `claude_master.requests` {route, client_account}, `claude_master.requests.by_client` {route, client} | counter | everything through the proxy (inference, count_tokens, control) |
+| `claude_master.sessions.tracked`, `claude_master.process.*` | gauge | conversations tracked; uptime, goroutines, heap |
+
+**Why the dimensions are not crossed.** A metrics backend such as CloudWatch bills every distinct combination of
+a metric's attributes as its own series. Crossing profile, model, client and account on every metric would be
+hundreds of series for a few users, so each axis has its own projection and no metric carries more than three
+attributes (a test enforces it). You can still split by any one axis, and `inference.requests` gives
+profile x account x status; what you give up is the full cross-product (say, one model on one box for one user).
+Through the CloudWatch agent: counters arrive as deltas (a Sum is a count), histograms as approximate statistic
+sets (Sum, SampleCount and Min/Max, no percentiles: use `inference.duration_quantile`), and the resource's
+`service.name` is an extra dimension.
+
+**Bounded by design.** The model and the user's account come from the client's request, so neither is used as
+written. A `model` must look like a Claude model name (it contains `claude`) and at most 64 distinct ones are
+kept; at most 256 unlabelled accounts are kept; everything else is `other` (or `unknown` when absent). Labelled
+accounts are bounded by your labels file. A client cannot create series, or put text of its own in a metric or
+a log, by choosing a model or an account.
+
+Not exported: token counts per request (the stream is forwarded untouched and never parsed), tokens, bodies, URLs,
+account ids, upstream error text.

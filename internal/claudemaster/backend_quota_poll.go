@@ -92,5 +92,7 @@ func (s *backendSeriesSelector) observePolledQuota(authID string, quota backendW
 	quota.used = min(max(quota.used, 0), 1)
 	s.quota[authID] = quota
 	s.quotaRevision[authID]++
+	s.noteQuotaLocked(authID, quota)
+	observeUsagePoll(s.profileNameLocked(authID), "ok")
 	return true
 }

@@ -9,9 +9,11 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"regexp"
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/claudemaster"
@@ -153,6 +155,8 @@ func run(args []string) (int, error) {
 		return 0, nil
 	}
 	switch {
+	case len(args) > 0 && args[0] == "account-key":
+		return runAccountKey(args[1:])
 	case len(args) > 0 && args[0] == "client-init":
 		return runClientInit(args[1:])
 	case len(args) > 0 && args[0] == "issue":
@@ -175,6 +179,23 @@ func run(args []string) (int, error) {
 	var backupAPIKeySource string
 	var modelMap modelMapFlag
 	var listen, stateDir, openLoopback string
+	var logLevel, logFile, logFormat string
+	var logMaxMB, logKeep int
+	var quotaLogInterval, otlpInterval time.Duration
+	var otlpEndpoint, accountLabelsFile string
+	var accountLabels stringListFlag
+	if command == "run" || command == "serve" {
+		flags.StringVar(&otlpEndpoint, "otlp-endpoint", os.Getenv("CLAUDE_MASTER_OTLP_ENDPOINT"), "export OpenTelemetry metrics to this OTLP/HTTP base URL, e.g. http://127.0.0.1:4318")
+		flags.DurationVar(&otlpInterval, "otlp-interval", 30*time.Second, "how often metrics are exported")
+		flags.Var(&accountLabels, "account-label", "name an incoming user's Anthropic account in metrics: ACCOUNT_UUID=NAME (repeatable; see: claude-master account-key)")
+		flags.StringVar(&accountLabelsFile, "account-labels-file", "", "a file of ACCOUNT_UUID=NAME lines")
+		flags.StringVar(&logLevel, "log-level", "", "debug, info, warn, error or off (default: info for serve, off for run)")
+		flags.StringVar(&logFile, "log-file", "", "append logs to this file, rotated by size (run requires it: the terminal belongs to Claude)")
+		flags.StringVar(&logFormat, "log-format", "text", "text or json")
+		flags.IntVar(&logMaxMB, "log-max-mb", 10, "rotate the log file at this size in MiB")
+		flags.IntVar(&logKeep, "log-keep", 5, "rotated log files to keep")
+		flags.DurationVar(&quotaLogInterval, "quota-log-interval", 0, "how often the quota and routing snapshot is logged (default 5m; a negative value turns it off)")
+	}
 	switch command {
 	case "serve":
 		flags.Var(&nextProfiles, "next-profile", "additional inference profile for quota-aware subscription rotation")
@@ -204,6 +225,40 @@ func run(args []string) (int, error) {
 		return 2, errors.New("probe does not accept Claude arguments or proxy diagnostics")
 	}
 	var backupAPIKey, consumedKeyEnv string
+	if command == "run" || command == "serve" {
+		level := logLevel
+		if level == "" {
+			level = "off"
+			if command == "serve" {
+				level = "info"
+			}
+		}
+		opts := claudemaster.LogOptions{Level: level, File: logFile, Format: logFormat, MaxBytes: int64(logMaxMB) << 20, Keep: logKeep}
+		if command == "serve" {
+			opts.Out = os.Stderr
+		}
+		if lvl, _ := claudemaster.ParseLogLevel(level); lvl != nil && opts.File == "" && opts.Out == nil {
+			return 2, errors.New("--log-level on run needs --log-file: the terminal belongs to Claude")
+		}
+		closeLog, err := claudemaster.ConfigureLogging(opts)
+		if err != nil {
+			return 2, err
+		}
+		defer closeLog()
+		labels, err := loadAccountLabels(accountLabels, accountLabelsFile)
+		if err != nil {
+			return 2, err
+		}
+		stopTelemetry, err := claudemaster.StartTelemetry(claudemaster.TelemetryOptions{Endpoint: otlpEndpoint, Interval: otlpInterval, AccountLabels: labels})
+		if err != nil {
+			return 2, err
+		}
+		defer func() {
+			// No deadline of ours (repository policy). If a collector hangs the final export, the service
+			// manager's stop timeout ends the process.
+			_ = stopTelemetry(context.Background())
+		}()
+	}
 	if command == "serve" && (listen == "" || stateDir == "") {
 		return 2, errors.New("serve requires --listen ADDRESS:PORT and --state-dir DIR")
 	}
@@ -244,7 +299,7 @@ func run(args []string) (int, error) {
 		// success and never restart it.
 		if err := claudemaster.Serve(ctx, profiles, claudemaster.ServeOptions{
 			LaunchOptions: claudemaster.LaunchOptions{BackupAPIKey: backupAPIKey, BackupAPIKeyEnv: consumedKeyEnv, ModelMap: modelMap},
-			Listen:        listen, StateDir: stateDir, OpenLoopback: openLoopback, Out: os.Stderr,
+			Listen:        listen, StateDir: stateDir, OpenLoopback: openLoopback, Out: os.Stderr, SnapshotInterval: quotaLogInterval,
 		}); err != nil {
 			return 1, err
 		}
@@ -262,7 +317,7 @@ func run(args []string) (int, error) {
 		}
 		return claudemaster.LaunchProfilesWithOptions(ctx, profiles, flags.Args(), claudemaster.LaunchOptions{
 			BackupAPIKey: backupAPIKey, BackupAPIKeyEnv: consumedKeyEnv,
-			ModelMap: modelMap, Diagnostics: diagnosticOutput,
+			ModelMap: modelMap, Diagnostics: diagnosticOutput, SnapshotInterval: quotaLogInterval,
 		})
 	}
 	profileLock, err := claudemaster.OpenProfile(name, command == "login")
@@ -401,4 +456,60 @@ func runConnect(ctx context.Context, args []string) (int, error) {
 		return 2, errors.New("usage: claude-master connect --server ADDRESS:PORT --dir DIR -- [Claude arguments]; or claude-master connect --open 127.0.0.1:PORT --ca FILE -- [Claude arguments] (defaults from CLAUDE_MASTER_SERVER, CLAUDE_MASTER_CLIENT_DIR, CLAUDE_MASTER_OPEN, CLAUDE_MASTER_CA)")
 	}
 	return claudemaster.Connect(ctx, claudemaster.ConnectOptions{Server: server, Dir: dir, Open: open, CAFile: caFile, Out: os.Stderr}, flags.Args())
+}
+
+var accountIDPattern = regexp.MustCompile(`^[0-9a-fA-F-]{8,64}$`)
+
+// loadAccountLabels reads ACCOUNT_UUID=NAME pairs from flags and an optional file. The UUID is only a key
+// into a lookup table: metrics carry the name, never the id.
+func loadAccountLabels(pairs []string, file string) (map[string]string, error) {
+	labels := make(map[string]string)
+	add := func(line string) error {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			return nil
+		}
+		id, name, ok := strings.Cut(line, "=")
+		if !ok {
+			id, name, ok = strings.Cut(line, " ")
+		}
+		id, name = strings.TrimSpace(id), strings.TrimSpace(name)
+		if !ok || name == "" || !accountIDPattern.MatchString(id) {
+			return errors.New("an account label must be ACCOUNT_UUID=NAME")
+		}
+		labels[strings.ToLower(id)] = name
+		return nil
+	}
+	for _, pair := range pairs {
+		if err := add(pair); err != nil {
+			return nil, err
+		}
+	}
+	if file != "" {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return nil, errors.New("cannot read --account-labels-file")
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if err := add(line); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return labels, nil
+}
+
+// runAccountKey prints the key the dashboards use for an Anthropic account id, so a label can be written
+// for it: claude-master account-key UUID...
+func runAccountKey(args []string) (int, error) {
+	if len(args) == 0 {
+		return 2, errors.New("usage: claude-master account-key ACCOUNT_UUID...")
+	}
+	for _, id := range args {
+		if !accountIDPattern.MatchString(id) {
+			return 2, errors.New("an account id is hexadecimal with dashes")
+		}
+		fmt.Fprintf(os.Stdout, "%s  %s\n", id, claudemaster.AccountKeyFor(id))
+	}
+	return 0, nil
 }
