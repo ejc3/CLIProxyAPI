@@ -84,6 +84,11 @@ func (e *sharedClaudeExecutor) rotateLocked(ctx context.Context, store *backendS
 	if err != nil {
 		return nil, err
 	}
+	// The executor stamps whole seconds; stamp this rotation precisely so two rotations (or a
+	// rotation and a stale save) in the same second are still ordered. See diskAhead.
+	if refreshed.Metadata != nil {
+		refreshed.Metadata["last_refresh"] = time.Now().UTC().Format(time.RFC3339Nano)
+	}
 	if _, err := store.saveLocked(refreshed); err != nil {
 		return nil, err
 	}

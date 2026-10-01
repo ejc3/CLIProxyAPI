@@ -240,3 +240,39 @@ func TestSharedUsagePollsAreServedFromAFreshCache(t *testing.T) {
 		t.Fatalf("a stale cache must be refetched: upstream calls = %d", upstream.Load())
 	}
 }
+
+// Rotations stamp whole-second times elsewhere; two token pairs with the SAME revision are a conflict
+// and the saved file must win, or a stale save could overwrite a pair that was just rotated.
+func TestSaveKeepsTheSavedPairWhenRevisionsTie(t *testing.T) {
+	opts, p := sharedProfile(t, 1)
+	store := p[0].store
+	same := time.Now().Add(time.Hour).UTC().Format(time.RFC3339) // one second, whole-second resolution
+	rotated := p[0].auth.Clone()
+	rotated.Metadata["access_token"], rotated.Metadata["refresh_token"] = "access-rotated-x", "refresh-rotated-x"
+	rotated.Metadata["last_refresh"] = same
+	if _, err := store.Save(t.Context(), rotated); err != nil {
+		t.Fatal(err)
+	}
+	// Another process, still holding the previous pair, saves in that same second.
+	stale := p[0].auth.Clone()
+	stale.Metadata["access_token"], stale.Metadata["refresh_token"] = "access-1", "refresh-1"
+	stale.Metadata["last_refresh"] = same
+	if _, err := store.Save(t.Context(), stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, refresh, _ := diskTokens(t, opts); refresh != "refresh-rotated-x" {
+		t.Fatalf("a stale pair with an equal timestamp overwrote the rotated one: %q", refresh)
+	}
+}
+
+func TestRotationsAreStampedBelowOneSecond(t *testing.T) {
+	_, p := sharedProfile(t, 1)
+	p[0].exec.rotate = (&fakeRotation{}).rotate
+	got, err := p[0].exec.Refresh(t.Context(), p[0].auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(credentialString(got.Metadata, "last_refresh"), ".") {
+		t.Fatalf("last_refresh %q has no sub-second part", got.Metadata["last_refresh"])
+	}
+}
