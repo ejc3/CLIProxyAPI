@@ -298,10 +298,10 @@ func clientAccountKey(raw []byte) string {
 		return "unknown"
 	}
 	if label, ok := tm().accountLabelsMap[id]; ok && label != "" {
-		return sanitizeDimension(label)
+		return sanitizeDimension(label) // bounded by the labels file
 	}
 	sum := sha256.Sum256([]byte(id))
-	return "acct-" + hex.EncodeToString(sum[:4])
+	return accounts.admit("acct-"+hex.EncodeToString(sum[:4]), "other")
 }
 
 // AccountKeyFor is what the dashboards will call an account id: use it to build --account-label values
@@ -473,7 +473,8 @@ func (s *limitGaugeStore) each(fn func(profile, window, measure string, v float6
 	}
 }
 
-var windowToken = regexp.MustCompile(`^\d+[smhdw]$`)
+// A window is a duration (5h, 7d) with optional qualifiers joined by underscores (7d_oi).
+var windowToken = regexp.MustCompile(`^\d+[smhdw](_[a-z0-9]+)*$`)
 var wordValue = regexp.MustCompile(`^[a-z][a-z0-9_]{0,23}$`)
 
 // recordRateLimitHeaders keeps the latest value of every Anthropic-Ratelimit-* header per profile:
@@ -593,4 +594,59 @@ func endpointHost(endpoint string) string {
 		return "invalid"
 	}
 	return u.Host
+}
+
+// ---------------------------------------------------------------- untrusted values
+
+// A model name and a user's account come from the CLIENT's request body, and a client can send anything:
+// a secret, an email, a different value every time. Neither is ever used as written. A model must look like a
+// model name; and only a bounded number of distinct models and unlabelled accounts are ever kept, so the
+// number of series is bounded whatever a client sends. The rest is "other".
+const (
+	maxDistinctModels   = 64
+	maxDistinctAccounts = 256
+)
+
+// Anthropic model names all contain "claude" (claude-opus-5, anthropic.claude-3-5-sonnet, us.anthropic.claude-...).
+var modelNamePattern = regexp.MustCompile(`^(?:[a-z]{2}\.)?(?:anthropic\.)?claude[a-z0-9._:-]{0,56}$`)
+
+type boundedValues struct {
+	mu   sync.Mutex
+	seen map[string]struct{}
+	max  int
+}
+
+func newBoundedValues(max int) *boundedValues {
+	return &boundedValues{seen: make(map[string]struct{}), max: max}
+}
+
+// admit returns v if it is already known or there is still room for it, otherwise overflow.
+func (b *boundedValues) admit(v, overflow string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.seen[v]; ok {
+		return v
+	}
+	if len(b.seen) >= b.max {
+		return overflow
+	}
+	b.seen[v] = struct{}{}
+	return v
+}
+
+var (
+	models   = newBoundedValues(maxDistinctModels)
+	accounts = newBoundedValues(maxDistinctAccounts)
+)
+
+// modelLabel is the only form of a request's model that metrics and logs ever see.
+func modelLabel(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return "unknown"
+	}
+	if !modelNamePattern.MatchString(raw) {
+		return "other"
+	}
+	return models.admit(raw, "other")
 }

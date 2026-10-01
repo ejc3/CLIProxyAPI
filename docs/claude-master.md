@@ -494,5 +494,11 @@ from its credential file name (those carry the account's email address).
 | `claude_master.requests` {route, client, client_account} | counter | everything through the proxy |
 | `claude_master.sessions.tracked`, `claude_master.process.*` | gauge | conversations tracked; uptime, goroutines, heap |
 
+**Bounded by design.** The model and the user's account come from the client's request, so neither is used as
+written. A `model` must look like a Claude model name (it contains `claude`) and at most 64 distinct ones are
+kept; at most 256 unlabelled accounts are kept; everything else is `other` (or `unknown` when absent). Labelled
+accounts are bounded by your labels file. A client cannot create series, or put text of its own in a metric or
+a log, by choosing a model or an account.
+
 Not exported: token counts per request (the stream is forwarded untouched and never parsed), tokens, bodies, URLs,
 account ids, upstream error text.
