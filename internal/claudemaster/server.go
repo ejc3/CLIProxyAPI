@@ -29,7 +29,7 @@ func Serve(ctx context.Context, profiles []Profile, opts ServeOptions) error {
 	if err != nil {
 		return fmt.Errorf("--listen: %w", err)
 	}
-	certs, err := loadOrCreatePersistentCertificate(opts.StateDir, []net.IP{ip})
+	certs, err := loadOrCreatePersistentCertificate(opts.StateDir, serverNames(ip))
 	if err != nil {
 		return err
 	}
@@ -48,6 +48,17 @@ func Serve(ctx context.Context, profiles []Profile, opts ServeOptions) error {
 	}
 	<-ctx.Done()
 	return nil
+}
+
+// serverNames are the addresses the server's certificate vouches for: the one it listens on, and
+// loopback, so a client can reach it through a local tunnel (an SSH or SSM port forward, a
+// cloudflared access tunnel) by dialling 127.0.0.1 and still verify who it is talking to.
+func serverNames(listen net.IP) []net.IP {
+	loopback := net.IPv4(127, 0, 0, 1)
+	if listen.Equal(loopback) {
+		return []net.IP{loopback}
+	}
+	return []net.IP{listen, loopback}
 }
 
 func startServerProxy(certs *processCertificate, listen string, inference http.Handler) (*Proxy, error) {
