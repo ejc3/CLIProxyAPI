@@ -2,6 +2,7 @@ package claudemaster
 
 import (
 	"context"
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -64,4 +65,10 @@ func finishRequest(c *gin.Context, ctx context.Context, opts BackendOptions, w *
 		}
 	}
 	observeRequest(obs)
+}
+
+// observeControl counts a request forwarded to the client's own account (Remote Control and the like). It is
+// not timed or sized: it only has to show up in the total, with its client.
+func observeControl(r *http.Request) {
+	observeRequest(requestObservation{Route: "control", Client: clientFromContext(r.Context()), Account: "unknown"})
 }
