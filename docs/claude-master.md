@@ -425,3 +425,33 @@ claude-master connect --open 127.0.0.1:8444 --ca ca.pem -- --remote-control
 - **A tunnel that is down is reported clearly** (nothing listening, or not a claude-master proxy)
   instead of as a hang inside Claude.
 - Defaults come from `CLAUDE_MASTER_OPEN` and `CLAUDE_MASTER_CA`.
+
+## Logging
+
+claude-master has its own log, separate from the upstream SDK's output (which stays discarded: it can carry
+credential paths and upstream response text). `serve` logs at **info** to stderr by default; `run` logs
+nothing unless asked (its stderr is Claude's terminal), and then only to a file.
+
+```bash
+claude-master serve ... --log-level info --log-file /var/log/claude-master/claude-master.log --log-max-mb 20 --log-keep 10
+claude-master run PROFILE --log-level debug --log-file ~/claude-master.log -- ...
+```
+
+`--log-level debug|info|warn|error|off`, `--log-format text|json`, `--quota-log-interval 5m` (a negative value
+turns the snapshot off). A log file rotates by size (`file` becomes `file.1`, `file.1` becomes `file.2`, up to
+`--log-keep`; the oldest is removed) and is `0600`.
+
+**What is never logged:** tokens, request or response bodies, URLs, account identifiers (emails, UUIDs) or
+upstream error text. Logs carry profile names (your own labels), a hashed conversation tag (`s-xxxxxxxx`),
+model names, status codes, durations, counts, quota fractions and client certificate names. A redaction filter
+backs that discipline up by masking secret-shaped keys and values.
+
+| level | event |
+|---|---|
+| info | `inference account switched` (conversation moved: `from`, `to`, `reason` = `reserve_reached`, `weekly_exhausted`, `rate_limited`, `rebalanced`, `subscriptions_exhausted`, `subscription_capacity_returned`) |
+| info | `profile rate limited` / `profile available again`; `quota band changed` (`ok` / `reserve` at 90% / `exhausted`) |
+| info | `login refreshed`, `login refresh adopted from another claude-master process`, `adopted a newer login after a 401` |
+| info | `quota` per profile and `routing summary` (requests per profile, switches, backup picks, refusals) every 5 minutes; `proxy summary` (connections, requests, active) every 5 minutes |
+| info | `client connected for the first time` (certificate name, or `tunnel`), `proxy listening`, `inference backend started` |
+| warn | `using the paid API-key backup` (once a minute), `no inference account could be chosen`, `profile credential rejected by Anthropic` (401/403: the login may need redoing), `Anthropic server error`, `login refresh failed`, `subscription usage poll failed`, `client TLS handshake failed` (once a minute per remote address) |
+| debug | every routing decision (`account chosen`), `conversation bound`, every quota observation, each client tunnel |

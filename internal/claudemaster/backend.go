@@ -50,6 +50,7 @@ type BackendOptions struct {
 	Model           string
 	UseRequestModel bool
 	ModelMap        map[string]string
+	Name            string // the profile's own name, for logs and metrics
 }
 
 // BackendCredential identifies one independently authenticated profile in an
@@ -58,6 +59,7 @@ type BackendCredential struct {
 	AuthDir  string
 	Provider string
 	AuthID   string
+	Name     string // the profile's own name, for logs and metrics
 }
 
 // BackendSeriesOptions groups Claude subscriptions for quota-aware selection.
@@ -68,11 +70,14 @@ type BackendSeriesOptions struct {
 	QuotaRequest ClaudeQuotaRequestFunc
 	BackupAPIKey string
 	ModelMap     map[string]string
+	// SnapshotInterval is how often the quota snapshot is logged (default 5 minutes, negative: never).
+	SnapshotInterval time.Duration
 }
 
 type backendRoutingOptions struct {
-	backupAPIKey string
-	modelMap     map[string]string
+	backupAPIKey     string
+	modelMap         map[string]string
+	snapshotInterval time.Duration
 }
 
 // Backend embeds inference, credential refresh, and subscription usage polling. It has no listener,
@@ -87,6 +92,7 @@ type Backend struct {
 	authIDs        []string
 	seriesSelector *backendSeriesSelector
 	quotaPollDone  <-chan struct{}
+	observeDone    <-chan struct{}
 	cancel         context.CancelFunc
 	once           sync.Once
 }
@@ -106,7 +112,7 @@ func NewBackendSeries(ctx context.Context, opts BackendSeriesOptions) (*Backend,
 	if opts.Credentials[0].Provider != "claude" {
 		return nil, errors.New("ordered inference currently supports Claude profiles only")
 	}
-	return newBackend(ctx, opts.Credentials, "", true, false, opts.QuotaRequest, backendRoutingOptions{backupAPIKey: opts.BackupAPIKey, modelMap: opts.ModelMap})
+	return newBackend(ctx, opts.Credentials, "", true, false, opts.QuotaRequest, backendRoutingOptions{backupAPIKey: opts.BackupAPIKey, modelMap: opts.ModelMap, snapshotInterval: opts.SnapshotInterval})
 }
 
 func newBackend(ctx context.Context, credentials []BackendCredential, modelName string, useRequestModel, pinSingle bool, quotaRequest ClaudeQuotaRequestFunc, routing backendRoutingOptions) (*Backend, error) {
@@ -144,11 +150,12 @@ func newBackend(ctx context.Context, credentials []BackendCredential, modelName 
 	authIDs := make([]string, 0, len(credentials))
 	credentialLocations := make(map[string]struct{}, len(credentials))
 	subscriptionIDs := make(map[string]struct{}, len(credentials))
+	profileNames := make(map[string]string, len(credentials)+1)
 	for i, credentialOpts := range credentials {
 		if credentialOpts.Provider != provider {
 			return nil, errors.New("ordered inference profiles must use one provider")
 		}
-		opts := BackendOptions{AuthDir: credentialOpts.AuthDir, Provider: credentialOpts.Provider, AuthID: credentialOpts.AuthID, Model: modelName, UseRequestModel: useRequestModel}
+		opts := BackendOptions{AuthDir: credentialOpts.AuthDir, Provider: credentialOpts.Provider, AuthID: credentialOpts.AuthID, Model: modelName, UseRequestModel: useRequestModel, Name: profileDisplayName(credentialOpts)}
 		location := filepath.Clean(opts.AuthDir) + "\x00" + opts.AuthID
 		if _, exists := credentialLocations[location]; exists {
 			return nil, errors.New("ordered inference profiles must be distinct")
@@ -174,6 +181,7 @@ func newBackend(ctx context.Context, credentials []BackendCredential, modelName 
 		stores = append(stores, store)
 		loaded = append(loaded, credential)
 		authIDs = append(authIDs, runtimeID)
+		profileNames[runtimeID] = profileDisplayName(credentialOpts)
 	}
 
 	subscriptionAuthIDs := append([]string(nil), authIDs...)
@@ -199,7 +207,7 @@ func newBackend(ctx context.Context, credentials []BackendCredential, modelName 
 		pinnedAuthID = authIDs[0]
 		selector = &backendSelector{authID: pinnedAuthID, provider: provider}
 	} else {
-		seriesSelector = &backendSeriesSelector{authIDs: subscriptionAuthIDs, backupAuthID: backupAuthID, provider: provider}
+		seriesSelector = &backendSeriesSelector{authIDs: subscriptionAuthIDs, backupAuthID: backupAuthID, provider: provider, names: profileNames}
 		routes, errRoutes := newBackendSessionStore(credentials, loaded, backupAuthID, backupAPIKey)
 		if errRoutes != nil {
 			return nil, errRoutes
@@ -269,6 +277,16 @@ func newBackend(ctx context.Context, credentials []BackendCredential, modelName 
 	if pollQuota {
 		backend.quotaPollDone = startBackendQuotaPolling(runCtx, manager, seriesSelector, subscriptionAuthIDs, quotaRequest, nil)
 	}
+	if seriesSelector != nil {
+		subscriptions := make([]string, 0, len(subscriptionAuthIDs))
+		for _, id := range subscriptionAuthIDs {
+			subscriptions = append(subscriptions, profileNames[id])
+		}
+		lg().Info("inference backend started", "mode", "pool", "profiles", strings.Join(subscriptions, ","), "api_backup", backupAPIKey != "")
+		backend.observeDone = startBackendObservation(runCtx, seriesSelector, routing.snapshotInterval)
+	} else {
+		lg().Info("inference backend started", "mode", "single", "profile", profileNames[authIDs[0]])
+	}
 	return backend, nil
 }
 
@@ -283,6 +301,10 @@ func (b *Backend) Close() error {
 		if b.quotaPollDone != nil {
 			<-b.quotaPollDone
 		}
+		if b.observeDone != nil {
+			<-b.observeDone
+		}
+		lg().Info("inference backend stopped")
 		b.manager.StopAutoRefreshAndWait()
 		// StopAutoRefreshAndWait also stops a stoppable selector. Keep the
 		// explicit call so this backend still owns the cache lifecycle if the
@@ -672,9 +694,24 @@ type backendSeriesSelector struct {
 	activeRoutes      map[string]map[string]int
 	now               func() time.Time
 	stopped           bool
+
+	names       map[string]string // runtime auth id -> the profile's own name, for logs and metrics
+	quotaBands  map[string]string
+	rateLimited map[string]bool
+	stats       *selectorStats
+	limiter     *every
 }
 
+// Pick chooses an account for a request and then records the decision (log and metrics).
 func (s *backendSeriesSelector) Pick(ctx context.Context, provider, model string, opts coreexecutor.Options, auths []*coreauth.Auth) (*coreauth.Auth, error) {
+	started := time.Now()
+	picked, err := s.pick(ctx, provider, model, opts, auths)
+	sessionID, _ := backendSeriesSessionIDs(opts)
+	s.noteSelection(sessionID, model, picked, err, time.Since(started))
+	return picked, err
+}
+
+func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string, opts coreexecutor.Options, auths []*coreauth.Auth) (*coreauth.Auth, error) {
 	if provider != s.provider && provider != "mixed" {
 		return nil, errors.New("inference provider differs from the ordered profiles")
 	}
@@ -827,6 +864,12 @@ func (s *backendSeriesSelector) pickBackupLocked(ctx context.Context, model stri
 	backup := backendSeriesAuthByID(auths, s.provider, s.backupAuthID)
 	if backup == nil {
 		return nil, errors.New("the final API-key backup is unavailable")
+	}
+	if s.limiter == nil {
+		s.limiter = newEvery(time.Minute)
+	}
+	if s.limiter.allow("backup") {
+		lg().Warn("every subscription is exhausted or rate limited: using the paid API-key backup", "session", sessionTag(sessionID))
 	}
 	picked, err := s.pickAuthLocked(ctx, model, opts, backup)
 	if err == nil && sessionID != "" && picked != nil {
@@ -1042,6 +1085,7 @@ func (s *backendSeriesSelector) observeQuota(authID string, quota backendWeeklyQ
 			if quota.used > existing.used {
 				existing.used = quota.used
 				s.quota[authID] = existing
+				s.noteQuotaLocked(authID, existing)
 			}
 			return
 		case !quota.resetsAt.IsZero() && !existing.resetsAt.IsZero() && quota.resetsAt.Before(existing.resetsAt):
@@ -1051,6 +1095,7 @@ func (s *backendSeriesSelector) observeQuota(authID string, quota backendWeeklyQ
 		}
 	}
 	s.quota[authID] = quota
+	s.noteQuotaLocked(authID, quota)
 }
 
 func backendAvailabilityModel(selectionModel string, opts coreexecutor.Options) string {
@@ -1091,6 +1136,7 @@ func (s *backendSeriesSelector) OnResult(result coreauth.Result) {
 		if !s.quotaBlockedLocked(result.AuthID) {
 			delete(s.quotaBackoffLevel, result.AuthID)
 		}
+		s.noteResultLocked(result, 0, time.Time{}, false)
 		return
 	}
 	if result.Error == nil {
@@ -1099,6 +1145,7 @@ func (s *backendSeriesSelector) OnResult(result coreauth.Result) {
 	credentialQuota := result.Error.HTTPStatus == http.StatusTooManyRequests && result.CredentialScope &&
 		result.Error.Code != coreauth.ErrorCodeRequestScoped && result.Error.Code != coreauth.ErrorCodeForceCooldown
 	if !credentialQuota {
+		s.noteResultLocked(result, 0, time.Time{}, false)
 		return
 	}
 	s.quotaRevision[result.AuthID]++
@@ -1131,6 +1178,7 @@ func (s *backendSeriesSelector) OnResult(result coreauth.Result) {
 		until = previous
 	}
 	s.quotaBlockedUntil[result.AuthID] = until
+	s.noteResultLocked(result, cooldown, until, result.RetryAfter != nil)
 }
 
 func setBackendResultPolicy(manager *coreauth.Manager, selector *backendSeriesSelector) {
@@ -1191,12 +1239,16 @@ func loadBackendWeeklyQuotas(ctx context.Context, manager *coreauth.Manager, sel
 				refreshed, errRefresh := manager.ForceRefreshAuth(refreshCtx, authID)
 				cancelRefresh()
 				if errRefresh != nil || refreshed == nil {
+					selector.noteUsagePoll(authID, "login could not be refreshed for the poll")
 					return
 				}
 				auth = refreshed
 			}
 			quota, known, errQuota := FetchClaudeWeeklyQuota(ctx, auth, quotaRequest)
 			if errQuota != nil || !known || ctx.Err() != nil {
+				if ctx.Err() == nil {
+					selector.noteUsagePoll(authID, "usage request failed or carried no weekly figure")
+				}
 				return
 			}
 			selector.observePolledQuota(authID, backendWeeklyQuota{known: true, used: quota.UsedFraction, resetsAt: quota.ResetsAt}, revision)

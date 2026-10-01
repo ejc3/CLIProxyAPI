@@ -24,8 +24,10 @@ type ServeOptions struct {
 	// loopback address (e.g. 127.0.0.1:8444), for clients that arrive through an authenticating
 	// tunnel. Whatever can reach that address is trusted.
 	OpenLoopback string
-	StateDir     string    // the server's CA lives here (private, 0700)
-	Out          io.Writer // one status line; never a secret
+	// SnapshotInterval is how often the quota and proxy summaries are logged (default 5 minutes).
+	SnapshotInterval time.Duration
+	StateDir         string    // the server's CA lives here (private, 0700)
+	Out              io.Writer // one status line; never a secret
 }
 
 // Serve runs the proxy for other boxes until ctx ends. The caller holds every profile lock.
@@ -43,7 +45,11 @@ func Serve(ctx context.Context, profiles []Profile, opts ServeOptions) error {
 	if err != nil {
 		return err
 	}
-	backend, err := newInferenceBackend(ctx, profiles, opts.LaunchOptions)
+	launch := opts.LaunchOptions
+	if launch.SnapshotInterval == 0 {
+		launch.SnapshotInterval = opts.SnapshotInterval
+	}
+	backend, err := newInferenceBackend(ctx, profiles, launch)
 	if err != nil {
 		return errors.New("cannot start the inference backend; check the profiles")
 	}
@@ -53,6 +59,9 @@ func Serve(ctx context.Context, profiles []Profile, opts ServeOptions) error {
 		return err
 	}
 	defer func() { _ = proxy.Close() }()
+	lg().Info("claude-master server started", "listen", proxy.Addr(), "open_loopback", proxy.OpenAddr(), "api_backup", opts.BackupAPIKey != "")
+	summaryDone := startProxySummary(ctx, proxy, opts.SnapshotInterval)
+	defer func() { <-summaryDone; lg().Info("claude-master server stopped") }()
 	if opts.Out != nil {
 		fmt.Fprintf(opts.Out, "claude-master serving on %s; clients trust %s\n", proxy.Addr(), certs.caPath)
 		if proxy.OpenAddr() != "" {
@@ -247,4 +256,41 @@ func checkOpen(ctx context.Context, endpoint string) error {
 		return fmt.Errorf("%s is not a claude-master proxy: does the tunnel lead to the server's open listener?", endpoint)
 	}
 	return nil
+}
+
+// startProxySummary logs what the proxy did since the last line, every interval (default 5 minutes;
+// negative turns it off). The returned channel closes when the goroutine has stopped.
+func startProxySummary(ctx context.Context, proxy *Proxy, interval time.Duration) <-chan struct{} {
+	done := make(chan struct{})
+	if interval < 0 {
+		close(done)
+		return done
+	}
+	if interval == 0 {
+		interval = defaultSnapshotInterval
+	}
+	go func() {
+		defer close(done)
+		previous := proxy.Snapshot()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				now := proxy.Snapshot()
+				lg().Info("proxy summary", "interval", interval.String(),
+					"connects_accepted", now.ConnectAccepted-previous.ConnectAccepted,
+					"connects_rejected", now.ConnectRejected-previous.ConnectRejected,
+					"api_requests", now.APIRequests-previous.APIRequests,
+					"inference_requests", now.InferenceRequests-previous.InferenceRequests,
+					"control_requests", now.ControlRequests-previous.ControlRequests,
+					"blocked_requests", now.BlockedRequests-previous.BlockedRequests,
+					"active_connections", now.ActiveConnections)
+				previous = now
+			}
+		}
+	}()
+	return done
 }

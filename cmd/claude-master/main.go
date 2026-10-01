@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/claudemaster"
@@ -175,6 +176,17 @@ func run(args []string) (int, error) {
 	var backupAPIKeySource string
 	var modelMap modelMapFlag
 	var listen, stateDir, openLoopback string
+	var logLevel, logFile, logFormat string
+	var logMaxMB, logKeep int
+	var quotaLogInterval time.Duration
+	if command == "run" || command == "serve" {
+		flags.StringVar(&logLevel, "log-level", "", "debug, info, warn, error or off (default: info for serve, off for run)")
+		flags.StringVar(&logFile, "log-file", "", "append logs to this file, rotated by size (run requires it: the terminal belongs to Claude)")
+		flags.StringVar(&logFormat, "log-format", "text", "text or json")
+		flags.IntVar(&logMaxMB, "log-max-mb", 10, "rotate the log file at this size in MiB")
+		flags.IntVar(&logKeep, "log-keep", 5, "rotated log files to keep")
+		flags.DurationVar(&quotaLogInterval, "quota-log-interval", 0, "how often the quota and routing snapshot is logged (default 5m; a negative value turns it off)")
+	}
 	switch command {
 	case "serve":
 		flags.Var(&nextProfiles, "next-profile", "additional inference profile for quota-aware subscription rotation")
@@ -204,6 +216,27 @@ func run(args []string) (int, error) {
 		return 2, errors.New("probe does not accept Claude arguments or proxy diagnostics")
 	}
 	var backupAPIKey, consumedKeyEnv string
+	if command == "run" || command == "serve" {
+		level := logLevel
+		if level == "" {
+			level = "off"
+			if command == "serve" {
+				level = "info"
+			}
+		}
+		opts := claudemaster.LogOptions{Level: level, File: logFile, Format: logFormat, MaxBytes: int64(logMaxMB) << 20, Keep: logKeep}
+		if command == "serve" {
+			opts.Out = os.Stderr
+		}
+		if lvl, _ := claudemaster.ParseLogLevel(level); lvl != nil && opts.File == "" && opts.Out == nil {
+			return 2, errors.New("--log-level on run needs --log-file: the terminal belongs to Claude")
+		}
+		closeLog, err := claudemaster.ConfigureLogging(opts)
+		if err != nil {
+			return 2, err
+		}
+		defer closeLog()
+	}
 	if command == "serve" && (listen == "" || stateDir == "") {
 		return 2, errors.New("serve requires --listen ADDRESS:PORT and --state-dir DIR")
 	}
@@ -244,7 +277,7 @@ func run(args []string) (int, error) {
 		// success and never restart it.
 		if err := claudemaster.Serve(ctx, profiles, claudemaster.ServeOptions{
 			LaunchOptions: claudemaster.LaunchOptions{BackupAPIKey: backupAPIKey, BackupAPIKeyEnv: consumedKeyEnv, ModelMap: modelMap},
-			Listen:        listen, StateDir: stateDir, OpenLoopback: openLoopback, Out: os.Stderr,
+			Listen:        listen, StateDir: stateDir, OpenLoopback: openLoopback, Out: os.Stderr, SnapshotInterval: quotaLogInterval,
 		}); err != nil {
 			return 1, err
 		}
@@ -262,7 +295,7 @@ func run(args []string) (int, error) {
 		}
 		return claudemaster.LaunchProfilesWithOptions(ctx, profiles, flags.Args(), claudemaster.LaunchOptions{
 			BackupAPIKey: backupAPIKey, BackupAPIKeyEnv: consumedKeyEnv,
-			ModelMap: modelMap, Diagnostics: diagnosticOutput,
+			ModelMap: modelMap, Diagnostics: diagnosticOutput, SnapshotInterval: quotaLogInterval,
 		})
 	}
 	profileLock, err := claudemaster.OpenProfile(name, command == "login")

@@ -441,3 +441,21 @@ func TestServeRefusesANonLoopbackOpenListener(t *testing.T) {
 		t.Fatalf("a non-loopback --open-loopback returned code %d, error %v", code, err)
 	}
 }
+
+// run's stderr is Claude's terminal, so logging there must go to a file.
+func TestRunLoggingNeedsAFileAndServeLevelsAreValidated(t *testing.T) {
+	home := canonicalHome(t)
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	installRunProfileFixture(t, home, "alpha")
+	code, err := run([]string{"run", "alpha", "--log-level", "info", "--", "--version"})
+	if err == nil || code != 2 || !strings.Contains(err.Error(), "--log-file") {
+		t.Fatalf("run --log-level info without a file: code=%d err=%v", code, err)
+	}
+	code, err = run([]string{"serve", "alpha", "--listen", "127.0.0.1:0", "--state-dir", filepath.Join(home, "state"), "--log-level", "loud"})
+	if err == nil || code != 2 {
+		t.Fatalf("an unknown level was accepted: code=%d err=%v", code, err)
+	}
+}
