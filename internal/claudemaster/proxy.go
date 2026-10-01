@@ -252,7 +252,19 @@ func (p *Proxy) track(conn net.Conn) *proxyConn {
 	return tracked
 }
 
+// proxyProbePath is the one request a proxy answers for itself. A client uses it to tell a claude-master
+// proxy from some other service at the same address; it reveals nothing and changes nothing.
+const (
+	proxyProbePath   = "/.claude-master/probe"
+	proxyProbeHeader = "X-Claude-Master"
+)
+
 func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && r.URL.Path == proxyProbePath {
+		w.Header().Set(proxyProbeHeader, "1")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if r.Method != http.MethodConnect {
 		p.counters.connectRejected.Add(1)
 		http.Error(w, "proxy expects HTTPS CONNECT", http.StatusBadRequest)

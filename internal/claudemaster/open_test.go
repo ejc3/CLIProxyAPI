@@ -134,3 +134,21 @@ func TestCheckOpenReportsATunnelThatIsDownOrLeadsElsewhere(t *testing.T) {
 		t.Fatalf("a tunnel that is down must say so: %v", err)
 	}
 }
+
+// Some other HTTP service answers every request with a perfectly good response. That must not pass
+// for the proxy: only the proxy's own probe header does.
+func TestCheckOpenIsNotFooledByAnOrdinaryHTTPService(t *testing.T) {
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "hello from some other service")
+	})}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+	if err := checkOpen(context.Background(), listener.Addr().String()); err == nil || !strings.Contains(err.Error(), "not a claude-master proxy") {
+		t.Fatalf("an ordinary HTTP service passed for the proxy: %v", err)
+	}
+}
