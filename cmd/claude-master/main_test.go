@@ -401,3 +401,18 @@ func TestOpenRunProfilesReleasesPartialLockSet(t *testing.T) {
 	}
 	_ = lock.Close()
 }
+
+// A server that cannot start must exit non-zero: systemd's Restart=on-failure and any deploy
+// script judge it by the exit status alone.
+func TestServeThatCannotStartExitsNonZero(t *testing.T) {
+	home := t.TempDir()
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	installRunProfileFixture(t, home, "alpha")
+	code, err := run([]string{"serve", "alpha", "--listen", "8.8.8.8:8443", "--state-dir", filepath.Join(home, "state")})
+	if err == nil || code == 0 {
+		t.Fatalf("serve with a public listen address returned code %d, error %v", code, err)
+	}
+}
