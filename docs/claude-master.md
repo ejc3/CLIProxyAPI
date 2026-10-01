@@ -397,3 +397,31 @@ claude-master connect --server 10.0.0.10:8443 --dir ~/.config/claude-master -- -
   the certificate. `CLAUDE_MASTER_SERVER` and `CLAUDE_MASTER_CLIENT_DIR` supply the defaults.
 - The server accepts `CONNECT` only from a certificate-bearing client, and terminates TLS only
   for `api.anthropic.com`, exactly as a local launch does.
+
+### Clients that arrive through a tunnel (no certificate)
+
+A client certificate is the right credential between machines you control. For a machine that is
+awkward to enrol (a laptop), the server can also serve an OPEN listener that asks for no
+certificate, on a loopback address only:
+
+```bash
+# on the server: the certificate listener as before, plus a loopback-only open one
+claude-master serve claude-connor --next-profile claude-ejc3 --next-profile claude-colton \
+  --listen 10.0.0.10:8443 --open-loopback 127.0.0.1:8444 --state-dir /var/lib/claude-master
+
+# on the laptop, behind a tunnel that authenticates (for example `cloudflared access tcp` to a
+# tunnel whose origin is the server's 127.0.0.1:8444, protected by an access policy):
+claude-master connect --open 127.0.0.1:8444 --ca ca.pem -- --remote-control
+```
+
+- **The trust is the tunnel.** Anything that can reach the open listener is served, so it must only
+  ever be reachable through something that authenticates. `serve` refuses an `--open-loopback`
+  address that is not a literal loopback address, and says so on its status line when the listener
+  is on. The certificate listener keeps demanding a certificate.
+- **`connect --open` also insists on loopback.** It speaks plain HTTP to the local end of the tunnel,
+  so it refuses any other address; an unauthenticated proxy request never crosses a network.
+- **It still needs the server's public `ca.pem`** (not a secret): the conversation inside the tunnel
+  is TLS to `api.anthropic.com`, terminated by the server's CA, exactly as for a certificate client.
+- **A tunnel that is down is reported clearly** (nothing listening, or not a claude-master proxy)
+  instead of as a hang inside Claude.
+- Defaults come from `CLAUDE_MASTER_OPEN` and `CLAUDE_MASTER_CA`.
