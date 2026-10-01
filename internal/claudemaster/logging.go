@@ -197,6 +197,12 @@ func (r *rotatingFile) open() error {
 	if err != nil {
 		return err
 	}
+	// The mode given to OpenFile applies only to a file it creates. An existing log (made by hand, by an
+	// older version, or copied) may be 0644: make it private before anything is appended to it.
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return err
+	}
 	info, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
@@ -237,6 +243,9 @@ func (r *rotatingFile) rotate() error {
 	if err := os.Rename(r.path, r.path+".1"); err != nil {
 		_ = r.open()
 		return err
+	}
+	for i := 1; i <= r.keep; i++ { // rotated copies are as private as the live file, whatever they were before
+		_ = os.Chmod(fmt.Sprintf("%s.%d", r.path, i), 0o600)
 	}
 	return r.open()
 }

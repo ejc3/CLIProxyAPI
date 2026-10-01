@@ -130,7 +130,7 @@ func (s *backendSeriesSelector) noteSelection(sessionID, model string, picked *c
 			s.limiter = newEvery(time.Minute)
 		}
 		if s.limiter.allow("refusal:" + err.Error()) {
-			lg().Warn("no inference account could be chosen", "session", sessionTag(sessionID), "model", model, "reason", err.Error())
+			lg().Warn("no inference account could be chosen", "session", sessionTag(sessionID), "model", modelLabel(model), "reason", err.Error())
 		}
 		return
 	}
@@ -144,7 +144,7 @@ func (s *backendSeriesSelector) noteSelection(sessionID, model string, picked *c
 		stats.backup++
 	}
 	observePick(name, took, isBackup)
-	lg().Debug("account chosen", "session", sessionTag(sessionID), "model", model, "profile", name, "took", took.Round(time.Microsecond).String())
+	lg().Debug("account chosen", "session", sessionTag(sessionID), "model", modelLabel(model), "profile", name, "took", took.Round(time.Microsecond).String())
 }
 
 // noteBoundLocked runs when a conversation is bound: a change of account is the event that matters.
