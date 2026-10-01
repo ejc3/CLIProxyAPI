@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"runtime"
 	"sort"
@@ -57,42 +56,47 @@ var (
 )
 
 type instruments struct {
-	connections      metric.Int64Counter
-	handshakeErrors  metric.Int64Counter
-	requests         metric.Int64Counter
-	inference        metric.Int64Counter
-	inferenceErrors  metric.Int64Counter
-	picks            metric.Int64Counter
-	switches         metric.Int64Counter
-	backup           metric.Int64Counter
-	rateLimited      metric.Int64Counter
-	refresh          metric.Int64Counter
-	usagePolls       metric.Int64Counter
-	limitState       metric.Int64Counter
-	duration         metric.Float64Histogram
-	ttfb             metric.Float64Histogram
-	upstreamTTFB     metric.Float64Histogram
-	overhead         metric.Float64Histogram
-	pickDuration     metric.Float64Histogram
-	requestBytes     metric.Int64Histogram
-	responseBytes    metric.Int64Histogram
-	registration     metric.Registration
-	quantiles        *quantileSet
-	limitGauges      *limitGaugeStore
-	quotaUsed        metric.Float64ObservableGauge
-	quotaResets      metric.Float64ObservableGauge
-	quotaBlocked     metric.Float64ObservableGauge
-	tokenExpires     metric.Float64ObservableGauge
-	quotaBand        metric.Int64ObservableGauge
-	sessions         metric.Int64ObservableGauge
-	activeConns      metric.Int64ObservableGauge
-	upstreamLimit    metric.Float64ObservableGauge
-	latencyQuantile  metric.Float64ObservableGauge
-	uptime           metric.Float64ObservableGauge
-	goroutines       metric.Int64ObservableGauge
-	heap             metric.Int64ObservableGauge
-	startedAt        time.Time
-	accountLabelsMap map[string]string
+	connections       metric.Int64Counter
+	handshakeErrors   metric.Int64Counter
+	requests          metric.Int64Counter
+	requestsByClient  metric.Int64Counter
+	inference         metric.Int64Counter
+	inferenceByModel  metric.Int64Counter
+	inferenceByClient metric.Int64Counter
+	inferenceErrors   metric.Int64Counter
+	picks             metric.Int64Counter
+	switches          metric.Int64Counter
+	backup            metric.Int64Counter
+	rateLimited       metric.Int64Counter
+	refresh           metric.Int64Counter
+	usagePolls        metric.Int64Counter
+	limitState        metric.Int64Counter
+	duration          metric.Float64Histogram
+	ttfb              metric.Float64Histogram
+	durationByModel   metric.Float64Histogram
+	ttfbByModel       metric.Float64Histogram
+	upstreamTTFB      metric.Float64Histogram
+	overhead          metric.Float64Histogram
+	pickDuration      metric.Float64Histogram
+	requestBytes      metric.Int64Histogram
+	responseBytes     metric.Int64Histogram
+	registration      metric.Registration
+	quantiles         *quantileSet
+	limitGauges       *limitGaugeStore
+	quotaUsed         metric.Float64ObservableGauge
+	quotaResets       metric.Float64ObservableGauge
+	quotaBlocked      metric.Float64ObservableGauge
+	tokenExpires      metric.Float64ObservableGauge
+	quotaBand         metric.Int64ObservableGauge
+	sessions          metric.Int64ObservableGauge
+	activeConns       metric.Int64ObservableGauge
+	upstreamLimit     metric.Float64ObservableGauge
+	latencyQuantile   metric.Float64ObservableGauge
+	uptime            metric.Float64ObservableGauge
+	goroutines        metric.Int64ObservableGauge
+	heap              metric.Int64ObservableGauge
+	startedAt         time.Time
+	accountLabelsMap  map[string]string
 }
 
 var activeInstruments atomic.Pointer[instruments]
@@ -125,12 +129,13 @@ func StartTelemetry(opts TelemetryOptions) (func(context.Context) error, error) 
 		}
 		reader = sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(interval))
 	}
-	instance := opts.Instance
-	if instance == "" {
-		instance, _ = os.Hostname()
+	// Resource attributes can become dimensions downstream, and one server needs no instance id: it is added
+	// only when one is configured.
+	resAttrs := []attribute.KeyValue{attribute.String("service.name", "claude-master")}
+	if opts.Instance != "" {
+		resAttrs = append(resAttrs, attribute.String("service.instance.id", opts.Instance))
 	}
-	res, err := resource.Merge(resource.Empty(), resource.NewSchemaless(
-		attribute.String("service.name", "claude-master"), attribute.String("service.instance.id", instance)))
+	res, err := resource.Merge(resource.Empty(), resource.NewSchemaless(resAttrs...))
 	if err != nil {
 		return nil, err
 	}
@@ -163,9 +168,12 @@ func buildInstruments(m metric.Meter, labels map[string]string) *instruments {
 	}
 	i.connections = counter("claude_master.proxy.connections", "Tunnel connections by listener and result")
 	i.handshakeErrors = counter("claude_master.proxy.tls_handshake_errors", "Client TLS handshakes that failed")
-	i.requests = counter("claude_master.requests", "Requests through the proxy by route, client and client account")
-	i.inference = counter("claude_master.inference.requests", "Inference requests by profile, model, status class, client and client account")
-	i.inferenceErrors = counter("claude_master.inference.errors", "Inference requests that ended in an error status")
+	i.requests = counter("claude_master.requests", "Requests through the proxy by route and client account")
+	i.requestsByClient = counter("claude_master.requests.by_client", "Requests through the proxy by route and client (the connecting box)")
+	i.inference = counter("claude_master.inference.requests", "Inference requests by profile, client account and status class")
+	i.inferenceByModel = counter("claude_master.inference.requests.by_model", "Inference requests by model and status class")
+	i.inferenceByClient = counter("claude_master.inference.requests.by_client", "Inference requests by client (the connecting box) and client account")
+	i.inferenceErrors = counter("claude_master.inference.errors", "Inference requests that ended in an error status, by profile, status and client account")
 	i.picks = counter("claude_master.routing.picks", "Routing decisions by chosen profile")
 	i.switches = counter("claude_master.routing.switches", "Conversations moved to another account, by from, to and reason")
 	i.backup = counter("claude_master.routing.backup_requests", "Requests served by the paid API-key backup")
@@ -174,7 +182,9 @@ func buildInstruments(m metric.Meter, labels map[string]string) *instruments {
 	i.usagePolls = counter("claude_master.usage.polls", "Subscription usage polls by profile and result")
 	i.limitState = counter("claude_master.anthropic.ratelimit.state", "Anthropic rate-limit status words seen, by profile, window and value")
 	i.duration = hist("claude_master.inference.duration", "ms", "Whole inference request, received to last byte")
+	i.durationByModel = hist("claude_master.inference.duration.by_model", "ms", "Whole inference request by model")
 	i.ttfb = hist("claude_master.inference.ttfb", "ms", "Request received to first response byte")
+	i.ttfbByModel = hist("claude_master.inference.ttfb.by_model", "ms", "Request received to first response byte, by model")
 	i.upstreamTTFB = hist("claude_master.inference.upstream_ttfb", "ms", "Account chosen to first response byte: Anthropic's own time to first byte")
 	i.overhead = hist("claude_master.proxy.overhead", "ms", "Request received to account chosen: claude-master's own added time")
 	i.pickDuration = hist("claude_master.routing.pick_duration", "ms", "Time the routing decision took")
@@ -358,25 +368,35 @@ func observeRequest(o requestObservation) {
 	if o.Profile == "" {
 		o.Profile = "none"
 	}
-	base := []attribute.KeyValue{attribute.String("client", o.Client), attribute.String("client_account", o.Account)}
-	t.requests.Add(ctx, 1, metric.WithAttributes(append([]attribute.KeyValue{attribute.String("route", o.Route)}, base...)...))
+	// COST SHAPE. CloudWatch makes every distinct combination of a metric's attributes its own billable custom
+	// metric, so the attributes are NOT crossed: each metric carries at most three, and each axis (profile,
+	// account, client, model) gets its own projection. The series count is then a sum of small numbers, not
+	// their product. TestNoMetricCrossesTheAxes keeps it that way.
+	route := attribute.String("route", o.Route)
+	account := attribute.String("client_account", o.Account)
+	client := attribute.String("client", o.Client)
+	t.requests.Add(ctx, 1, metric.WithAttributes(route, account))
+	t.requestsByClient.Add(ctx, 1, metric.WithAttributes(route, client))
 	if o.Route != "inference" {
 		return
 	}
-	attrs := append([]attribute.KeyValue{
-		attribute.String("profile", o.Profile), attribute.String("model", o.Model),
-		attribute.String("status_class", statusClass(o.Status)), attribute.Bool("stream", o.Stream)}, base...)
-	t.inference.Add(ctx, 1, metric.WithAttributes(attrs...))
+	profile := attribute.String("profile", o.Profile)
+	class := attribute.String("status_class", statusClass(o.Status))
+	model := attribute.String("model", o.Model)
+	t.inference.Add(ctx, 1, metric.WithAttributes(profile, account, class))
+	t.inferenceByModel.Add(ctx, 1, metric.WithAttributes(model, class))
+	t.inferenceByClient.Add(ctx, 1, metric.WithAttributes(client, account))
 	if o.Status >= 400 || o.Status == 0 {
-		t.inferenceErrors.Add(ctx, 1, metric.WithAttributes(append([]attribute.KeyValue{
-			attribute.String("profile", o.Profile), attribute.String("status", strconv.Itoa(o.Status))}, base...)...))
+		t.inferenceErrors.Add(ctx, 1, metric.WithAttributes(profile, attribute.String("status", strconv.Itoa(o.Status)), account))
 	}
-	shape := metric.WithAttributes(attribute.String("profile", o.Profile), attribute.String("model", o.Model),
-		attribute.String("status_class", statusClass(o.Status)), attribute.Bool("stream", o.Stream))
+	shape := metric.WithAttributes(profile, class)
+	byModel := metric.WithAttributes(model)
 	t.duration.Record(ctx, ms(o.Duration), shape)
+	t.durationByModel.Record(ctx, ms(o.Duration), byModel)
 	t.quantiles.add(o.Profile, ms(o.Duration))
 	if o.TTFB > 0 {
 		t.ttfb.Record(ctx, ms(o.TTFB), shape)
+		t.ttfbByModel.Record(ctx, ms(o.TTFB), byModel)
 		if o.Overhead > 0 && o.TTFB > o.Overhead {
 			t.upstreamTTFB.Record(ctx, ms(o.TTFB-o.Overhead), shape)
 		}

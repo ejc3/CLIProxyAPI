@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 func freshBounds(t *testing.T) {
@@ -93,8 +94,8 @@ func TestARequestWithASecretLookingModelLeavesNoTraceInMetricsOrLogs(t *testing.
 			t.Fatalf("%q reached the log:\n%s", secret, logs.String())
 		}
 	}
-	if got := sumOf(rm, "claude_master.inference.requests", map[string]string{"model": "other"}); got != 2 {
-		t.Fatalf("inference.requests{model=other} = %d, want 2", got)
+	if got := sumOf(rm, "claude_master.inference.requests.by_model", map[string]string{"model": "other"}); got != 2 {
+		t.Fatalf("inference.requests.by_model{model=other} = %d, want 2", got)
 	}
 }
 
@@ -154,4 +155,77 @@ func TestAnExistingLooseLogFileAndItsRotationsBecomePrivate(t *testing.T) {
 			t.Errorf("%s is %v, want 0600", filepath.Base(name), got)
 		}
 	}
+}
+
+// CloudWatch bills every distinct combination of a metric's attributes as its own custom metric. A metric that
+// crosses profile, model, client and account explodes into hundreds. Each axis has its own projection and no
+// metric carries more than three attributes; model never meets profile or client, and client never meets
+// profile or model.
+func TestNoMetricCrossesTheAxes(t *testing.T) {
+	freshBounds(t)
+	reader := startMetrics(t, map[string]string{testAccountUUID: "colton"})
+	backend := newBackendNativeResponseFixture(t)
+	backend.seriesSelector.names = map[string]string{backend.authIDs[0]: "claude-connor"}
+	backend.manager.SetRoundTripperProvider(&upstream{status: 529, headers: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.1"}}})
+	_ = serve(t, backend, inferenceRequest(testAccountUUID, true))
+	observeControl(httptest.NewRequest(http.MethodGet, "/v1/sessions", nil))
+	rm := collect(t, reader)
+	seen := 0
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			for _, set := range attributeSets(m) {
+				seen++
+				if len(set) > 3 {
+					t.Errorf("%s carries %d attributes %v: at most 3, or the series count multiplies", m.Name, len(set), keysOf(set))
+				}
+				if _, ok := set["model"]; ok && (has(set, "profile") || has(set, "client") || has(set, "client_account")) {
+					t.Errorf("%s crosses model with profile, client or account: %v", m.Name, keysOf(set))
+				}
+				if _, ok := set["client"]; ok && (has(set, "profile") || has(set, "model") || has(set, "status_class")) {
+					t.Errorf("%s crosses client with profile, model or status: %v", m.Name, keysOf(set))
+				}
+			}
+		}
+	}
+	if seen < 20 {
+		t.Fatalf("only %d data points inspected: the test is not looking at the request metrics", seen)
+	}
+}
+
+func has(set map[string]string, key string) bool { _, ok := set[key]; return ok }
+
+func keysOf(set map[string]string) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	return out
+}
+
+// attributeSets is the attributes of every data point of a metric, whatever its type.
+func attributeSets(m metricdata.Metrics) []map[string]string {
+	var out []map[string]string
+	switch data := m.Data.(type) {
+	case metricdata.Sum[int64]:
+		for _, p := range data.DataPoints {
+			out = append(out, attributesOf(p.Attributes))
+		}
+	case metricdata.Gauge[int64]:
+		for _, p := range data.DataPoints {
+			out = append(out, attributesOf(p.Attributes))
+		}
+	case metricdata.Gauge[float64]:
+		for _, p := range data.DataPoints {
+			out = append(out, attributesOf(p.Attributes))
+		}
+	case metricdata.Histogram[float64]:
+		for _, p := range data.DataPoints {
+			out = append(out, attributesOf(p.Attributes))
+		}
+	case metricdata.Histogram[int64]:
+		for _, p := range data.DataPoints {
+			out = append(out, attributesOf(p.Attributes))
+		}
+	}
+	return out
 }
