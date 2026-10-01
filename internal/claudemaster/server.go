@@ -158,13 +158,25 @@ func checkServer(ctx context.Context, ip net.IP, port string, identity ClientIde
 	// certificate is reported here, not later as a confusing failure inside Claude. The proxy answers
 	// anything that is not a CONNECT with a plain 400, which is all this needs.
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := io.WriteString(conn, "OPTIONS * HTTP/1.1\r\nHost: claude-master\r\n\r\n"); err == nil {
-		_, err = http.ReadResponse(bufio.NewReader(conn), nil)
-		if err != nil {
-			return serverError(net.JoinHostPort(ip.String(), port), err)
-		}
-	} else {
+	if err := probeProxy(conn); err != nil {
 		return serverError(net.JoinHostPort(ip.String(), port), err)
+	}
+	return nil
+}
+
+// probeProxy asks the connection for the proxy's own probe response and requires the header only a
+// claude-master proxy sets, so "some HTTP service answered" is not mistaken for "the proxy answered".
+func probeProxy(conn net.Conn) error {
+	if _, err := io.WriteString(conn, "GET "+proxyProbePath+" HTTP/1.1\r\nHost: claude-master\r\nConnection: close\r\n\r\n"); err != nil {
+		return err
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	if resp.Header.Get(proxyProbeHeader) != "1" {
+		return errors.New("not a claude-master proxy")
 	}
 	return nil
 }
@@ -231,10 +243,7 @@ func checkOpen(ctx context.Context, endpoint string) error {
 	}
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := io.WriteString(conn, "OPTIONS * HTTP/1.1\r\nHost: claude-master\r\n\r\n"); err != nil {
-		return fmt.Errorf("%s did not answer: is the tunnel running and does it lead to the server's open listener?", endpoint)
-	}
-	if _, err := http.ReadResponse(bufio.NewReader(conn), nil); err != nil {
+	if err := probeProxy(conn); err != nil {
 		return fmt.Errorf("%s is not a claude-master proxy: does the tunnel lead to the server's open listener?", endpoint)
 	}
 	return nil
