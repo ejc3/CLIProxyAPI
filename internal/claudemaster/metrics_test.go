@@ -199,9 +199,21 @@ func TestAnInferenceRequestIsMeasuredByProfileAccountAndTiming(t *testing.T) {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 	}
 	rm := collect(t, reader)
-	shape := map[string]string{"profile": "claude-connor", "model": "claude-opus-5", "status_class": "2xx", "client": "unknown", "client_account": "colton"}
-	if got := sumOf(rm, "claude_master.inference.requests", shape); got != 1 {
-		t.Fatalf("inference.requests = %d for %v", got, shape)
+	// One projection per axis, never their product (see TestNoMetricCrossesTheAxes).
+	for name, shape := range map[string]map[string]string{
+		"claude_master.inference.requests":           {"profile": "claude-connor", "status_class": "2xx", "client_account": "colton"},
+		"claude_master.inference.requests.by_model":  {"model": "claude-opus-5", "status_class": "2xx"},
+		"claude_master.inference.requests.by_client": {"client": "unknown", "client_account": "colton"},
+		"claude_master.requests.by_client":           {"route": "inference", "client": "unknown"},
+	} {
+		if got := sumOf(rm, name, shape); got != 1 {
+			t.Fatalf("%s = %d for %v", name, got, shape)
+		}
+	}
+	for _, name := range []string{"claude_master.inference.duration.by_model", "claude_master.inference.ttfb.by_model"} {
+		if got := histCount(rm, name, map[string]string{"model": "claude-opus-5"}); got != 1 {
+			t.Errorf("%s has %d observations for the model, want 1", name, got)
+		}
 	}
 	if got := sumOf(rm, "claude_master.requests", map[string]string{"route": "inference", "client_account": "colton"}); got != 1 {
 		t.Fatalf("requests = %d", got)

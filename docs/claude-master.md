@@ -477,11 +477,14 @@ from its credential file name (those carry the account's email address).
 
 | metric | kind | what it answers |
 |---|---|---|
-| `claude_master.inference.requests` {profile, model, status_class, stream, client, client_account} | counter | who uses what, split by account, box, model |
-| `claude_master.inference.duration`, `.ttfb`, `.upstream_ttfb` {profile, model, status_class, stream} | histogram ms | how fast: whole request, first byte, and Anthropic's own time to first byte |
+| `claude_master.inference.requests` {profile, client_account, status_class} | counter | which subscription served which user, and how it went |
+| `claude_master.inference.requests.by_model` {model, status_class} | counter | traffic by model |
+| `claude_master.inference.requests.by_client` {client, client_account} | counter | which box (certificate name) carries which user's traffic |
+| `claude_master.inference.duration`, `.ttfb`, `.upstream_ttfb` {profile, status_class} | histogram ms | how fast: whole request, first byte, and Anthropic's own time to first byte |
+| `claude_master.inference.duration.by_model`, `.ttfb.by_model` {model} | histogram ms | latency by model |
 | `claude_master.proxy.overhead` {profile} | histogram ms | claude-master's own added time (request in to account chosen) |
 | `claude_master.inference.duration_quantile` {profile, quantile 0.5/0.95/0.99} | gauge ms | recent p50/p95/p99, so CloudWatch can chart percentiles |
-| `claude_master.inference.errors` {profile, status, client, client_account} | counter | Anthropic errors by status |
+| `claude_master.inference.errors` {profile, status, client_account} | counter | Anthropic errors by status |
 | `claude_master.inference.request_bytes`, `.response_bytes` {profile} | histogram | sizes |
 | `claude_master.quota.used_fraction`, `.resets_in_seconds`, `.rate_limited_for_seconds`, `.band` {profile} | gauge | each subscription's weekly allowance, when it resets, any cooldown, band (0 ok, 1 reserve, 2 exhausted, -1 unknown) |
 | `claude_master.anthropic.ratelimit` {profile, window, measure} | gauge | EVERY `Anthropic-Ratelimit-*` header: windows `5h`, `7d`, `api`; measures `utilization`, `resets_in_seconds`, `remaining`, `limit` ... |
@@ -491,8 +494,17 @@ from its credential file name (those carry the account's email address).
 | `claude_master.auth.refresh` {profile, result}, `claude_master.auth.token_expires_in_seconds` {profile} | counter / gauge | login health |
 | `claude_master.usage.polls` {profile, result} | counter | usage polls: `ok`, `failed`, `cache_hit` |
 | `claude_master.proxy.connections` {listener, result}, `.active_connections`, `.tls_handshake_errors` | counter / gauge | clients and refused clients |
-| `claude_master.requests` {route, client, client_account} | counter | everything through the proxy |
+| `claude_master.requests` {route, client_account}, `claude_master.requests.by_client` {route, client} | counter | everything through the proxy (inference, count_tokens, control) |
 | `claude_master.sessions.tracked`, `claude_master.process.*` | gauge | conversations tracked; uptime, goroutines, heap |
+
+**Why the dimensions are not crossed.** A metrics backend such as CloudWatch bills every distinct combination of
+a metric's attributes as its own series. Crossing profile, model, client and account on every metric would be
+hundreds of series for a few users, so each axis has its own projection and no metric carries more than three
+attributes (a test enforces it). You can still split by any one axis, and `inference.requests` gives
+profile x account x status; what you give up is the full cross-product (say, one model on one box for one user).
+Through the CloudWatch agent: counters arrive as deltas (a Sum is a count), histograms as approximate statistic
+sets (Sum, SampleCount and Min/Max, no percentiles: use `inference.duration_quantile`), and the resource's
+`service.name` is an extra dimension.
 
 **Bounded by design.** The model and the user's account come from the client's request, so neither is used as
 written. A `model` must look like a Claude model name (it contains `claude`) and at most 64 distinct ones are
