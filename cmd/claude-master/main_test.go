@@ -365,9 +365,15 @@ func TestOpenRunProfilesPreservesRequestedOrderAndReleasesAllLocks(t *testing.T)
 	if len(profiles) != 2 || profiles[0].Name != "zeta" || profiles[1].Name != "alpha" {
 		t.Fatalf("profile order changed: %#v", profiles)
 	}
-	if competing, errOpen := claudemaster.OpenProfile("alpha", false); errOpen == nil {
+	// Runs share a profile (several Claude Code windows, one login); a login needs it alone.
+	other, errShared := claudemaster.OpenProfile("alpha", false)
+	if errShared != nil {
+		t.Fatalf("a second run could not share the profile: %v", errShared)
+	}
+	_ = other.Close()
+	if competing, errOpen := claudemaster.OpenProfile("alpha", true); errOpen == nil {
 		_ = competing.Close()
-		t.Fatal("series did not reserve every profile")
+		t.Fatal("a login took a profile that a run is using")
 	}
 	closeProfileLocks(locks)
 	for _, name := range []string{"alpha", "zeta"} {
