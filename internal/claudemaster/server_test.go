@@ -298,3 +298,43 @@ func TestServerCertificateNamesLoopbackSoATunnelClientCanVerifyIt(t *testing.T) 
 		t.Errorf("a loopback listener listed loopback twice: %v", got)
 	}
 }
+
+// The server's certificate is one the client trusts, but the server does not accept THIS client's
+// certificate. With TLS 1.3 the client's handshake still succeeds; the rejection is an alert on the
+// next read, so checkServer must read before it reports success.
+func TestConnectReportsAClientCertificateTheServerDoesNotAccept(t *testing.T) {
+	stateDir, certs, _ := newTestServer(t)
+	dir := issueTestClient(t, stateDir, "dev-box-1", 30)
+	identity, err := LoadClientIdentity(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPool := x509.NewCertPool()
+	otherCerts, err := loadOrCreatePersistentCertificate(filepath.Join(t.TempDir(), "other"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPool.AddCert(otherCerts.ca) // the server will accept only certificates from ANOTHER CA
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		GetCertificate: certs.proxyServerCertificate, ClientAuth: tls.RequireAndVerifyClientCert,
+		ClientCAs: otherPool, MinVersion: tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _ = conn.(*tls.Conn).Handshake(); _ = conn.Close() }()
+		}
+	}()
+	host, port, _ := net.SplitHostPort(listener.Addr().String())
+	err = checkServer(context.Background(), net.ParseIP(host), port, identity)
+	if err == nil || !strings.Contains(err.Error(), "did not accept this box's certificate") {
+		t.Fatalf("a server that rejects this box's certificate must say so, not report success: %v", err)
+	}
+}
