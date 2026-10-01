@@ -64,15 +64,17 @@ func proxyTestStartWithCertificate(t *testing.T, inference http.Handler, control
 			return nil, errors.New("unexpected control request")
 		})
 	}
-	p, err := StartProxy(ProxyOptions{Certificate: cert, Inference: inference, ControlTransport: control})
+	auth := newProxyTestAuth(t)
+	p, err := StartProxy(auth.apply(ProxyOptions{Certificate: cert, Inference: inference, ControlTransport: control}))
 	if err != nil {
 		t.Fatal(err)
 	}
+	proxyTestAuths.Store(p, auth)
 	proxyURL, err := url.Parse(p.URL())
 	if err != nil {
 		t.Fatal(err)
 	}
-	transport := &http.Transport{Proxy: http.ProxyURL(proxyURL), TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}}
+	transport := &http.Transport{Proxy: http.ProxyURL(proxyURL), TLSClientConfig: auth.clientTLS(pool)}
 	client := &http.Client{Transport: transport}
 	t.Cleanup(func() { transport.CloseIdleConnections(); _ = p.Close() })
 	return p, client, pool
@@ -232,12 +234,11 @@ func TestProxyRejectsUnknownOrAmbiguousPaths(t *testing.T) {
 
 func proxyTestTLSConnection(t *testing.T, p *Proxy, pool *x509.CertPool, authority string) *tls.Conn {
 	t.Helper()
-	proxyURL, _ := url.Parse(p.URL())
-	conn, err := net.Dial("tcp", proxyURL.Host)
+	conn, err := proxyTestDialRaw(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: %s\r\n\r\n", authority, authority, p.proxyAuth)
+	_, err = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", authority, authority)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,13 +310,12 @@ func (conn *proxyPipelinedClientConn) Read(b []byte) (int, error) {
 
 func TestProxyPipelinedConnectClientHello(t *testing.T) {
 	p, _, pool := proxyTestStart(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusAccepted) }), nil)
-	proxyURL, _ := url.Parse(p.URL())
-	raw, err := net.Dial("tcp", proxyURL.Host)
+	raw, err := proxyTestDialRaw(p)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = raw.Close() }()
-	pipelined := &proxyPipelinedClientConn{Conn: raw, reader: bufio.NewReader(raw), header: fmt.Sprintf("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\nProxy-Authorization: %s\r\n\r\n", p.proxyAuth)}
+	pipelined := &proxyPipelinedClientConn{Conn: raw, reader: bufio.NewReader(raw), header: fmt.Sprintf("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n")}
 	conn := tls.Client(pipelined, &tls.Config{ServerName: masterAPIHost, RootCAs: pool, MinVersion: tls.VersionTLS12})
 	defer func() { _ = conn.Close() }()
 	if err := conn.Handshake(); err != nil {
@@ -332,15 +332,14 @@ func TestProxyPipelinedConnectClientHello(t *testing.T) {
 	}
 }
 
-func TestProxyRejectsConnectAuthoritiesAndProxyAuthentication(t *testing.T) {
+func TestProxyRejectsConnectAuthoritiesAndNonConnectRequests(t *testing.T) {
 	p, _, _ := proxyTestStart(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("unexpected inference") }), nil)
-	proxyURL, _ := url.Parse(p.URL())
 	for _, authority := range []string{"api.anthropic.com:80", "api.anthropic.com:444", "api.anthropic.com", "other.invalid:80", "user@api.anthropic.com:443", "api.anthropic.com:443/path", "api.anthropic.com%2e:443", "api..anthropic.com:443", "-invalid.example:443"} {
-		conn, err := net.Dial("tcp", proxyURL.Host)
+		conn, err := proxyTestDialRaw(p)
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, _ = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: %s\r\n\r\n", authority, authority, p.proxyAuth)
+		_, _ = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", authority, authority)
 		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 		if err == nil {
 			_ = resp.Body.Close()
@@ -354,11 +353,9 @@ func TestProxyRejectsConnectAuthoritiesAndProxyAuthentication(t *testing.T) {
 		raw    string
 		status int
 	}{
-		{"CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\nProxy-Authorization: Basic SECRET\r\n\r\n", 407},
-		{"CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n", 407},
 		{"GET http://api.anthropic.com/v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n", 400},
 	} {
-		conn, err := net.Dial("tcp", proxyURL.Host)
+		conn, err := proxyTestDialRaw(p)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -460,13 +457,12 @@ func TestProxyClosesIncompleteConnectAndActiveHandlers(t *testing.T) {
 		}
 	}()
 	<-started
-	proxyURL, _ := url.Parse(p.URL())
-	conn, err := net.Dial("tcp", proxyURL.Host)
+	conn, err := proxyTestDialRaw(p)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = conn.Close() }()
-	_, _ = fmt.Fprintf(conn, "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\nProxy-Authorization: %s\r\n\r\n", p.proxyAuth)
+	_, _ = fmt.Fprintf(conn, "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n")
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil || resp.StatusCode != 200 {
 		t.Fatalf("partial TLS setup failed: %v", err)
@@ -502,7 +498,11 @@ func TestProxyControlErrorsAreSanitized(t *testing.T) {
 
 func TestProxyRejectsIncompleteOptions(t *testing.T) {
 	cert, _ := proxyTestCertificate(t)
-	for _, opts := range []ProxyOptions{{}, {Certificate: cert}, {Inference: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})}} {
+	auth := newProxyTestAuth(t)
+	complete := auth.apply(ProxyOptions{Certificate: cert, Inference: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})})
+	noProxyCert, noClientCAs := complete, complete
+	noProxyCert.ProxyCertificate, noClientCAs.ClientCAs = nil, nil
+	for _, opts := range []ProxyOptions{{}, {Certificate: cert}, {Inference: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})}, noProxyCert, noClientCAs} {
 		if p, err := StartProxy(opts); err == nil {
 			_ = p.Close()
 			t.Fatal("incomplete options accepted")
@@ -627,26 +627,21 @@ func TestProxyEnvironmentControlsUseMasterControlOnly(t *testing.T) {
 	}
 }
 
-func TestProxyPerProcessAuthentication(t *testing.T) {
+func TestProxyRejectsAnotherProxysClientCertificate(t *testing.T) {
 	first, _, _ := proxyTestStart(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), nil)
 	second, _, _ := proxyTestStart(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), nil)
-	if first.proxyAuth == second.proxyAuth {
-		t.Fatal("proxy authentication was reused between processes")
+	if proxyTestAuthFor(first).certs.ca.SerialNumber.Cmp(proxyTestAuthFor(second).certs.ca.SerialNumber) == 0 {
+		t.Fatal("two proxies shared a CA")
 	}
-	proxyURL, _ := url.Parse(second.URL())
-	conn, err := net.Dial("tcp", proxyURL.Host)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = conn.Close() }()
-	_, _ = fmt.Fprintf(conn, "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\nProxy-Authorization: %s\r\n\r\n", first.proxyAuth)
-	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusProxyAuthRequired {
-		t.Fatal("another proxy's credential was accepted")
+	config := proxyTestAuthFor(second).clientTLS(nil)
+	config.Certificates = []tls.Certificate{proxyTestAuthFor(first).client}
+	conn, err := tls.Dial("tcp", second.Addr(), config)
+	if err == nil {
+		defer func() { _ = conn.Close() }()
+		_, _ = conn.Write([]byte("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n"))
+		if _, err = http.ReadResponse(bufio.NewReader(conn), nil); err == nil {
+			t.Fatal("another proxy's client certificate was accepted")
+		}
 	}
 }
 
@@ -697,12 +692,11 @@ func TestProxySnapshotCountsOnlyRoutingEvents(t *testing.T) {
 	for _, path := range []string{"/v1/messages", "/v1/code/sessions", "/v1/unknown"} {
 		proxyTestRequest(t, client, http.MethodPost, path, `{}`, http.Header{"Authorization": {"Bearer SNAPSHOT-CANARY"}})
 	}
-	proxyURL, _ := url.Parse(p.URL())
-	conn, err := net.Dial("tcp", proxyURL.Host)
+	conn, err := proxyTestDialRaw(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = io.WriteString(conn, "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\nProxy-Authorization: Basic WRONG-CANARY\r\n\r\n")
+	_, _ = io.WriteString(conn, "CONNECT api.anthropic.com:80 HTTP/1.1\r\nHost: api.anthropic.com:80\r\n\r\n")
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
 		_ = conn.Close()
@@ -736,13 +730,12 @@ func TestProxySnapshotCountsOnlyRoutingEvents(t *testing.T) {
 
 func TestProxySnapshotDistinguishesConnectFromTLSRequests(t *testing.T) {
 	p, _, _ := proxyTestStart(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("TLS never completed") }), nil)
-	proxyURL, _ := url.Parse(p.URL())
-	conn, err := net.Dial("tcp", proxyURL.Host)
+	conn, err := proxyTestDialRaw(p)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = conn.Close() }()
-	_, _ = fmt.Fprintf(conn, "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\nProxy-Authorization: %s\r\n\r\n", p.proxyAuth)
+	_, _ = fmt.Fprintf(conn, "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n")
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil || resp.StatusCode != 200 {
 		t.Fatalf("CONNECT failed: %v", err)

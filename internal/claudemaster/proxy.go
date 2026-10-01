@@ -4,10 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
-	"crypto/subtle"
 	"crypto/tls"
-	"encoding/base64"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"io"
@@ -33,6 +31,13 @@ type ProxyOptions struct {
 	GetCertificate   func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 	Inference        http.Handler
 	ControlTransport http.RoundTripper
+
+	// The proxy's own listener is TLS and requires a client certificate signed by ClientCAs before it
+	// reads a single request: there is no password. ProxyCertificate is what it presents to clients.
+	ProxyCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
+	ClientCAs        *x509.CertPool
+	// Listen is the address to bind; the default is an ephemeral IPv4 loopback port.
+	Listen string
 }
 
 // ProxyStats is a best-effort, counter-only diagnostic snapshot. It never
@@ -62,7 +67,6 @@ type proxyCounters struct {
 // Only api.anthropic.com is TLS-terminated; other HTTPS hosts are blind tunnels.
 type Proxy struct {
 	url         string
-	proxyAuth   string
 	ctx         context.Context
 	cancel      context.CancelFunc
 	outer       *http.Server
@@ -86,19 +90,24 @@ func StartProxy(opts ProxyOptions) (*Proxy, error) {
 	if opts.Inference == nil || opts.GetCertificate == nil && (len(opts.Certificate.Certificate) == 0 || opts.Certificate.PrivateKey == nil) {
 		return nil, errors.New("proxy requires an inference handler and TLS certificate")
 	}
-	secret := make([]byte, 32)
-	if _, err := rand.Read(secret); err != nil {
-		return nil, errors.New("cannot generate proxy authentication")
+	if opts.ProxyCertificate == nil || opts.ClientCAs == nil {
+		return nil, errors.New("proxy requires its own certificate and the client CAs it accepts")
 	}
-	password := base64.RawURLEncoding.EncodeToString(secret)
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	network, address := "tcp4", "127.0.0.1:0"
+	if opts.Listen != "" {
+		network, address = "tcp", opts.Listen
+	}
+	rawListener, err := net.Listen(network, address)
 	if err != nil {
-		return nil, errors.New("cannot bind local proxy")
+		return nil, errors.New("cannot bind the proxy")
 	}
+	listener := tls.NewListener(rawListener, &tls.Config{
+		GetCertificate: opts.ProxyCertificate, ClientCAs: opts.ClientCAs, ClientAuth: tls.RequireAndVerifyClientCert,
+		MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"},
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Proxy{
-		url:       "http://claude-master:" + password + "@" + listener.Addr().String(),
-		proxyAuth: "Basic " + base64.StdEncoding.EncodeToString([]byte("claude-master:"+password)), ctx: ctx, cancel: cancel,
+		url: "https://" + rawListener.Addr().String(), ctx: ctx, cancel: cancel,
 		inference: opts.Inference, conns: make(map[*proxyConn]struct{}),
 		tlsConfig: &tls.Config{Certificates: []tls.Certificate{opts.Certificate}, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}},
 	}
@@ -107,7 +116,7 @@ func StartProxy(opts ProxyOptions) (*Proxy, error) {
 		p.tlsConfig.Certificates = nil
 		p.tlsConfig.GetCertificate = opts.GetCertificate
 	}
-	p.innerListen = &proxyListener{connections: make(chan net.Conn), done: make(chan struct{}), addr: listener.Addr()}
+	p.innerListen = &proxyListener{connections: make(chan net.Conn), done: make(chan struct{}), addr: rawListener.Addr()}
 	transport := opts.ControlTransport
 	if transport == nil {
 		// Deliberately bypass the child's proxy environment and use normal public
@@ -139,9 +148,11 @@ func StartProxy(opts ProxyOptions) (*Proxy, error) {
 	return p, nil
 }
 
-// URL includes the per-process proxy password. Pass it only to the child process;
-// do not log it or expose it in status output.
+// URL is the proxy's https address. It carries no credential: clients authenticate with a certificate.
 func (p *Proxy) URL() string { return p.url }
+
+// Addr is the address the proxy listens on.
+func (p *Proxy) Addr() string { return strings.TrimPrefix(p.url, "https://") }
 
 // Snapshot can be displayed without exposing the proxy's private capability or
 // user data. ActiveConnections counts owned CONNECT sockets, including both ends
@@ -218,12 +229,6 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodConnect {
 		p.counters.connectRejected.Add(1)
 		http.Error(w, "proxy expects HTTPS CONNECT", http.StatusBadRequest)
-		return
-	}
-	if len(r.Header.Values("Proxy-Authorization")) != 1 || subtle.ConstantTimeCompare([]byte(r.Header.Get("Proxy-Authorization")), []byte(p.proxyAuth)) != 1 {
-		p.counters.connectRejected.Add(1)
-		w.Header().Set("Proxy-Authenticate", `Basic realm="claude-master"`)
-		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 		return
 	}
 	host, err := proxyAuthority(r.RequestURI)
