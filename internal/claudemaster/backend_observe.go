@@ -368,7 +368,7 @@ func (s *backendSeriesSelector) metricsSnapshot(stores []*backendStore) stateSna
 		snap.Profiles = append(snap.Profiles, p)
 	}
 	if s.sessions != nil {
-		snap.Sessions = int64(s.sessions.Len())
+		snap.Sessions, snap.HasSessions = int64(s.sessions.Len()), true
 	}
 	return snap
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"runtime"
@@ -118,8 +119,7 @@ func StartTelemetry(opts TelemetryOptions) (func(context.Context) error, error) 
 			interval = defaultMetricInterval
 		}
 		exporter, err := otlpmetrichttp.New(context.Background(),
-			otlpmetrichttp.WithEndpointURL(strings.TrimRight(opts.Endpoint, "/")+"/v1/metrics"),
-			otlpmetrichttp.WithTimeout(10*time.Second))
+			otlpmetrichttp.WithEndpointURL(strings.TrimRight(opts.Endpoint, "/")+"/v1/metrics"))
 		if err != nil {
 			return nil, errors.New("cannot create the OTLP metric exporter")
 		}
@@ -141,7 +141,7 @@ func StartTelemetry(opts TelemetryOptions) (func(context.Context) error, error) 
 	}
 	inst := buildInstruments(provider.Meter("claude-master"), labels)
 	activeInstruments.Store(inst)
-	lg().Info("telemetry started", "endpoint", opts.Endpoint, "account_labels", len(labels))
+	lg().Info("telemetry started", "endpoint_host", endpointHost(opts.Endpoint), "account_labels", len(labels))
 	return func(ctx context.Context) error {
 		activeInstruments.Store(nil)
 		if inst.registration != nil {
@@ -218,6 +218,7 @@ type profileState struct {
 type stateSnapshot struct {
 	Profiles       []profileState
 	Sessions       int64
+	HasSessions    bool
 	ActiveConns    int64
 	HasActiveConns bool
 }
@@ -246,7 +247,9 @@ func (i *instruments) observe(_ context.Context, o metric.Observer) error {
 				o.ObserveFloat64(i.tokenExpires, p.TokenExpiresIn, attrs)
 			}
 		}
-		o.ObserveInt64(i.sessions, snap.Sessions)
+		if snap.HasSessions {
+			o.ObserveInt64(i.sessions, snap.Sessions)
+		}
 		if snap.HasActiveConns {
 			o.ObserveInt64(i.activeConns, snap.ActiveConns)
 		}
@@ -427,15 +430,25 @@ func observeHandshakeError() {
 
 // ---------------------------------------------------------------- Anthropic's own rate-limit headers
 
+// limitNow is the clock the reset countdowns are read against; tests move it.
+var limitNow = time.Now
+
 type limitKey struct{ profile, window, measure string }
 
 type limitGaugeStore struct {
 	mu     sync.Mutex
 	values map[limitKey]float64
+	resets map[limitKey]time.Time // absolute: the countdown is computed when the gauge is read
 }
 
 func newLimitGaugeStore() *limitGaugeStore {
-	return &limitGaugeStore{values: make(map[limitKey]float64)}
+	return &limitGaugeStore{values: make(map[limitKey]float64), resets: make(map[limitKey]time.Time)}
+}
+
+func (s *limitGaugeStore) setReset(profile, window, measure string, at time.Time) {
+	s.mu.Lock()
+	s.resets[limitKey{profile, window, measure}] = at
+	s.mu.Unlock()
 }
 
 func (s *limitGaugeStore) set(profile, window, measure string, v float64) {
@@ -446,9 +459,13 @@ func (s *limitGaugeStore) set(profile, window, measure string, v float64) {
 
 func (s *limitGaugeStore) each(fn func(profile, window, measure string, v float64)) {
 	s.mu.Lock()
-	snapshot := make(map[limitKey]float64, len(s.values))
+	snapshot := make(map[limitKey]float64, len(s.values)+len(s.resets))
 	for k, v := range s.values {
 		snapshot[k] = v
+	}
+	now := limitNow()
+	for k, at := range s.resets {
+		snapshot[k] = max(at.Sub(now).Seconds(), 0)
 	}
 	s.mu.Unlock()
 	for k, v := range snapshot {
@@ -473,7 +490,7 @@ func (i *instruments) recordRateLimitHeaders(profile string, headers http.Header
 		raw := strings.TrimSpace(values[0])
 		if strings.HasSuffix(measure, "reset") {
 			if t, ok := parseQuotaTime(raw); ok {
-				i.limitGauges.set(profile, window, measure+"s_in_seconds", max(time.Until(t).Seconds(), 0))
+				i.limitGauges.setReset(profile, window, measure+"s_in_seconds", t)
 			}
 			continue
 		}
@@ -566,4 +583,14 @@ func (q *quantileSet) each(fn func(profile string, quantile, value float64)) {
 			fn(s.profile, quantile, s.values[index])
 		}
 	}
+}
+
+// endpointHost is all of a collector address that is ever logged: an address may carry credentials in its
+// user information or query, and those must never reach a log.
+func endpointHost(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return "invalid"
+	}
+	return u.Host
 }

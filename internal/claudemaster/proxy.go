@@ -452,6 +452,7 @@ func (p *Proxy) handleAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.counters.controlRequests.Add(1)
+		observeControl(r)
 		p.control.ServeHTTP(w, r)
 		return
 	}
@@ -462,6 +463,7 @@ func (p *Proxy) handleAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.counters.controlRequests.Add(1)
+	observeControl(r)
 	p.control.ServeHTTP(w, r)
 }
 
