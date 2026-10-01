@@ -283,14 +283,14 @@ later request.
   launch holds each profile SHARED until shutdown; only a login needs it alone. A subscription
   login rotates on every refresh and the previous access token stops working immediately, so the
   launchers coordinate through the credential file, which is the single source of truth:
-  - a refresh runs under an exclusive lock (, beside the auth directory) and
+  - a refresh runs under an exclusive lock (`auth.refresh.lock`, beside the auth directory) and
     first re-reads the file. If another launcher already rotated, it adopts that credential and
     does not call Anthropic;
-  - every request notices a newer saved credential (one ) and uses it;
+  - every request notices a newer saved credential (one `stat`) and uses it;
   - a 401 adopts a newer saved credential, or rotates under the lock (at most once per 30 seconds
     per launcher), then retries once before any response is exposed;
   - a save never writes older tokens over newer ones;
-  - the usage poll is served from a short-lived cache file (, 45 s) when another
+  - the usage poll is served from a short-lived cache file (`auth.usage`, 45 s) when another
     launcher fetched it, so N launchers make about one usage request a minute per account.
   The kernel releases the lock when its holder dies, so a crashed launcher cannot wedge the rest.
   Conversation routing records are one file per session and need no coordination. A Codex profile
