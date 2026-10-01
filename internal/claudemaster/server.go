@@ -1,6 +1,7 @@
 package claudemaster
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -128,14 +129,31 @@ func checkServer(ctx context.Context, ip net.IP, port string, identity ClientIde
 	dialer := &tls.Dialer{Config: &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{pair}, ServerName: ip.String(), MinVersion: tls.VersionTLS12}}
 	conn, err := dialer.DialContext(dialCtx, "tcp", net.JoinHostPort(ip.String(), port))
 	if err != nil {
-		reason := "is it running, and is this box allowed to reach it?"
-		if strings.Contains(err.Error(), "certificate") || strings.Contains(err.Error(), "bad") {
-			reason = "it did not accept this box's certificate (expired, or issued by another server)"
-		}
-		return fmt.Errorf("cannot connect to the claude-master server at %s: %s", net.JoinHostPort(ip.String(), port), reason)
+		return serverError(net.JoinHostPort(ip.String(), port), err)
 	}
-	_ = conn.Close()
+	defer func() { _ = conn.Close() }()
+	// With TLS 1.3 the client handshake returns before the server has judged the client certificate:
+	// a rejection arrives as an alert on the next read. Ask for one response so an unaccepted
+	// certificate is reported here, not later as a confusing failure inside Claude. The proxy answers
+	// anything that is not a CONNECT with a plain 400, which is all this needs.
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(conn, "OPTIONS * HTTP/1.1\r\nHost: claude-master\r\n\r\n"); err == nil {
+		_, err = http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			return serverError(net.JoinHostPort(ip.String(), port), err)
+		}
+	} else {
+		return serverError(net.JoinHostPort(ip.String(), port), err)
+	}
 	return nil
+}
+
+func serverError(endpoint string, err error) error {
+	reason := "is it running, and is this box allowed to reach it?"
+	if strings.Contains(err.Error(), "certificate") || strings.Contains(err.Error(), "bad") {
+		reason = "it did not accept this box's certificate (expired, or issued by another server)"
+	}
+	return fmt.Errorf("cannot connect to the claude-master server at %s: %s", endpoint, reason)
 }
 
 func x509CertPool(pemData []byte) *x509.CertPool {

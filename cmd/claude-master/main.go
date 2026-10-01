@@ -239,10 +239,15 @@ func run(args []string) (int, error) {
 			return 1, err
 		}
 		defer closeProfileLocks(locks)
-		return 0, claudemaster.Serve(ctx, profiles, claudemaster.ServeOptions{
+		// A server that could not start must exit non-zero, or a service manager would call it a
+		// success and never restart it.
+		if err := claudemaster.Serve(ctx, profiles, claudemaster.ServeOptions{
 			LaunchOptions: claudemaster.LaunchOptions{BackupAPIKey: backupAPIKey, BackupAPIKeyEnv: consumedKeyEnv, ModelMap: modelMap},
 			Listen:        listen, StateDir: stateDir, Out: os.Stderr,
-		})
+		}); err != nil {
+			return 1, err
+		}
+		return 0, nil
 	}
 	if command == "run" {
 		profiles, locks, err := openRunProfiles(profileNames)
