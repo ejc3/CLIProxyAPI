@@ -49,16 +49,22 @@ type handshakeErrorWriter struct {
 	onError func()
 }
 
-var handshakeLine = regexp.MustCompile(`TLS handshake error from ([^:\s]+)(?::\d+)?: (.*)`)
+var handshakeLine = regexp.MustCompile(`TLS handshake error from (\S+?): (.*)`)
 
 func (w *handshakeErrorWriter) Write(p []byte) (int, error) {
 	line := strings.TrimSpace(string(p))
 	if m := handshakeLine.FindStringSubmatch(line); m != nil {
+		// "127.0.0.1:5000" or "[::1]:5000": the host only, with or without brackets.
+		remote := m[1]
+		if host, _, err := net.SplitHostPort(remote); err == nil {
+			remote = host
+		}
+		if w.limiter.allow("handshake:" + remote) {
+			lg().Warn("client TLS handshake failed", "remote", remote, "reason", m[2])
+		}
+		// Counted after the line is written: a test (or an operator) that sees the count has seen the log.
 		if w.onError != nil {
 			w.onError()
-		}
-		if w.limiter.allow("handshake:" + m[1]) {
-			lg().Warn("client TLS handshake failed", "remote", m[1], "reason", m[2])
 		}
 		return len(p), nil
 	}

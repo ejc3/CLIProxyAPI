@@ -254,9 +254,9 @@ func run(args []string) (int, error) {
 			return 2, err
 		}
 		defer func() {
-			flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = stopTelemetry(flushCtx)
+			// No deadline of ours (repository policy). If a collector hangs the final export, the service
+			// manager's stop timeout ends the process.
+			_ = stopTelemetry(context.Background())
 		}()
 	}
 	if command == "serve" && (listen == "" || stateDir == "") {

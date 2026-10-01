@@ -71,7 +71,7 @@ func TestInfoLogSaysWhenAConversationMovesToAnotherAccount(t *testing.T) {
 	out := logs.String()
 	for _, want := range []string{
 		"inference account switched", "from=claude-connor", "to=claude-ejc3", "reason=reserve_reached",
-		"quota band changed", "profile=claude-connor", "from=ok", "to=reserve", "level=INFO",
+		"quota band changed", "profile=claude-connor", "from=ok", "to=reserve", "level=info",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the info log is missing %q:\n%s", want, out)
@@ -118,7 +118,7 @@ func TestARateLimitAndTheProfileComingBackAreBothLogged(t *testing.T) {
 	result.RetryAfter = &retry
 	selector.OnResult(result)
 	out := logs.String()
-	for _, want := range []string{"profile rate limited", "profile=claude-connor", "status=429", "cooldown=1m30s", "until=2026-10-01T12:01:30Z"} {
+	for _, want := range []string{"profile rate limited", "profile=claude-connor", "status=429", "cooldown=1m30s", `until="2026-10-01T12:01:30Z"`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q:\n%s", want, out)
 		}
@@ -136,7 +136,7 @@ func TestACredentialRejectionIsAWarningWithoutUpstreamText(t *testing.T) {
 	selector.OnResult(coreauth.Result{AuthID: "profile-b", Provider: "claude", CredentialScope: true,
 		Error: &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: "token sk-ant-oat01-LEAKME-LEAKME was revoked for alice@example.com"}})
 	out := logs.String()
-	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "profile=claude-ejc3") || !strings.Contains(out, "status=401") {
+	if !strings.Contains(out, "level=warning") || !strings.Contains(out, "profile=claude-ejc3") || !strings.Contains(out, "status=401") {
 		t.Fatalf("a rejected login was not a warning:\n%s", out)
 	}
 	for _, secret := range []string{"LEAKME", "alice@example.com", "revoked"} {

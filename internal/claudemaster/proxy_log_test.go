@@ -91,6 +91,7 @@ func TestAClientOnTheOpenListenerIsCalledTunnel(t *testing.T) {
 
 func TestARefusedCertificateIsOneWarningAMinuteWithTheRemoteAddress(t *testing.T) {
 	logs := captureLogs(t, "info")
+	reader := startMetrics(t, nil)
 	stateDir, _, proxy, _, _ := startNamedServer(t, false)
 	good := issueTestClient(t, stateDir, "dev-box-1", 30)
 	otherState := filepath.Join(canonicalTestTempDir(t), "state")
@@ -115,12 +116,20 @@ func TestARefusedCertificateIsOneWarningAMinuteWithTheRemoteAddress(t *testing.T
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
-	time.Sleep(100 * time.Millisecond)
+	// The handshake counter is bumped after a line is logged (or suppressed), so three means all three
+	// refusals have been through the limiter: no sleeping, nothing left to arrive late.
+	for sumOf(collect(t, reader), "claude_master.proxy.tls_handshake_errors", nil) < 3 {
+		select {
+		case <-deadline:
+			t.Fatalf("only some of the refusals were counted:\n%s", logs.String())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
 	out := logs.String()
 	if got := strings.Count(out, "client TLS handshake failed"); got != 1 {
 		t.Fatalf("%d handshake warnings for one remote in a minute, want 1:\n%s", got, out)
 	}
-	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "remote=127.0.0.1") {
+	if !strings.Contains(out, "level=warning") || !strings.Contains(out, "remote=127.0.0.1") {
 		t.Fatalf("the refusal is not a warning naming the remote:\n%s", out)
 	}
 }
