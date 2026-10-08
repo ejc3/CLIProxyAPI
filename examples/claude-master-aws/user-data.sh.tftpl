@@ -1,0 +1,184 @@
+#!/bin/bash
+# Bootstrap for the claude-master server. Idempotent: running it again converges the box (it swaps the pinned binary
+# atomically and rewrites the unit; it never restarts a running server).
+set -uxo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+TAG='${release_tag}'
+SHA='${binary_sha256}'
+HOME_DIR=/var/lib/claude-master
+
+# ---------------------------------------------------------------- swap first: a 1 GB box's first boot is its memory peak
+if ! swapon --show=NAME --noheadings | grep -q .; then
+  fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
+  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+apt-get update -y || true
+apt-get install -y curl jq unzip || echo "WARNING: some base packages failed"
+
+%{ if backup_secret_id != "" ~}
+# The AWS CLI reads the optional backup API key at service start.
+if ! command -v aws >/dev/null 2>&1; then
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip
+  (cd /tmp && unzip -qo awscliv2.zip && ./aws/install) ; rm -rf /tmp/aws /tmp/awscliv2.zip
+fi
+%{ endif ~}
+
+# ---------------------------------------------------------------- the service account
+# Its own unix user: the logins and the CA key are readable by this account and root, not by the login user.
+id claude-master >/dev/null 2>&1 || useradd --system --create-home --home-dir "$HOME_DIR" --shell /usr/sbin/nologin claude-master
+install -d -m 0700 -o claude-master -g claude-master "$HOME_DIR" "$HOME_DIR/state"
+
+# ---------------------------------------------------------------- the pinned binary (refuses a download that does not match)
+current=$(sha256sum /usr/local/bin/claude-master 2>/dev/null | cut -d' ' -f1)
+if [ "$current" != "$SHA" ]; then
+  if curl -fsSL "https://github.com/ejc3/CLIProxyAPI/releases/download/$TAG/claude-master-linux-arm64" -o /tmp/claude-master.new \
+     && echo "$SHA  /tmp/claude-master.new" | sha256sum -c - ; then
+    install -m 0755 /tmp/claude-master.new /usr/local/bin/claude-master.new && mv -f /usr/local/bin/claude-master.new /usr/local/bin/claude-master
+    echo "claude-master $TAG installed; a running server keeps its old binary until it is restarted"
+  else
+    echo "ERROR: claude-master $TAG did not download or did not match its sha256; leaving the installed binary alone" >&2
+  fi
+  rm -f /tmp/claude-master.new
+fi
+
+# ---------------------------------------------------------------- how the server starts
+mkdir -p /etc/claude-master
+cat > /usr/local/bin/claude-master-serve <<'EOF2'
+#!/bin/bash
+set -u
+%{ if backup_secret_id != "" ~}
+{ set +x; } 2>/dev/null   # the value below must never reach a trace
+key=$(aws secretsmanager get-secret-value --region ${region} --secret-id '${backup_secret_id}' --query SecretString --output text 2>/dev/null) || key=""
+if [ -n "$key" ] && [ "$key" != "None" ]; then export CLAUDE_MASTER_BACKUP_API_KEY="$key"; else echo "claude-master-serve: no backup API key; subscriptions only" >&2; fi
+unset key
+%{ endif ~}
+exec /usr/local/bin/claude-master serve ${profiles[0]}%{ for p in slice(profiles, 1, length(profiles)) } --next-profile ${p}%{ endfor } \
+  --listen ${private_ip}:${port} --state-dir /var/lib/claude-master/state \
+  --log-level info --log-file /var/log/claude-master/server.log --log-max-mb 20 --log-keep 5 --quota-log-interval 5m \
+%{ if enable_cloudwatch ~}
+  --otlp-endpoint http://127.0.0.1:4318 --otlp-interval 60s \
+%{ endif ~}
+  --account-labels-file /etc/claude-master/account-labels
+EOF2
+chmod 0755 /usr/local/bin/claude-master-serve
+
+# Names for the INCOMING users' Anthropic accounts in dashboards, one ACCOUNT_UUID=NAME per line (kept if it exists).
+if [ ! -e /etc/claude-master/account-labels ]; then
+  printf '%s\n' '# ACCOUNT_UUID=NAME, one per line. The UUID is oauthAccount.accountUuid in a user'"'"'s ~/.claude.json;' '# `claude-master account-key UUID` shows the key an unnamed account gets (acct-<8 hex>).' > /etc/claude-master/account-labels
+  chmod 0644 /etc/claude-master/account-labels
+fi
+
+# Small box: cap the journal.
+mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nSystemMaxUse=200M\nMaxRetentionSec=30day\n' > /etc/systemd/journald.conf.d/claude-master.conf
+
+cat > /etc/systemd/system/claude-master-server.service <<'EOF2'
+[Unit]
+Description=claude-master server (shared Claude subscription pool)
+After=network-online.target
+Wants=network-online.target
+# Idle until every profile has a login: `sudo claude-master-login PROFILE` for each, then start it.
+%{ for p in profiles ~}
+ConditionPathExists=/var/lib/claude-master/.local/share/claude-master/profiles/${p}/current
+%{ endfor ~}
+
+[Service]
+User=claude-master
+Group=claude-master
+Environment=HOME=/var/lib/claude-master
+LogsDirectory=claude-master
+LogsDirectoryMode=0750
+ExecStart=/usr/local/bin/claude-master-serve
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/claude-master
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF2
+systemctl daemon-reload
+systemctl enable claude-master-server.service >/dev/null 2>&1 || true
+
+%{ if enable_cloudwatch ~}
+# ---------------------------------------------------------------- CloudWatch agent (OTLP metrics + the log file)
+# Receives the proxy's OTLP metrics on 127.0.0.1:4318 (it turns cumulative counters into deltas), publishes them in the
+# ${metrics_namespace} namespace with memory and swap, and ships /var/log/claude-master/server.log to ${log_group}.
+CWA_VERSION='${cwagent_version}'
+CWA_SHA='${cwagent_sha256}'
+if ! dpkg-query -W -f='$${Version}' amazon-cloudwatch-agent 2>/dev/null | grep -q "^$CWA_VERSION"; then
+  if curl -fsSL --retry 3 "https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/arm64/$CWA_VERSION/amazon-cloudwatch-agent.deb" -o /tmp/cwagent.deb \
+     && echo "$CWA_SHA  /tmp/cwagent.deb" | sha256sum -c - >/dev/null; then
+    dpkg -i /tmp/cwagent.deb >/dev/null 2>&1 || apt-get install -y -f >/dev/null 2>&1
+  else
+    echo "ERROR: cloudwatch agent $CWA_VERSION did not download or did not match its sha256; metrics and logs will not ship" >&2
+  fi
+  rm -f /tmp/cwagent.deb
+fi
+if [ -d /opt/aws/amazon-cloudwatch-agent/etc ]; then
+  cat > /tmp/cwagent.json <<'EOF2'
+{
+  "agent": { "metrics_collection_interval": 60, "run_as_user": "root", "omit_hostname": true },
+  "metrics": {
+    "namespace": "${metrics_namespace}",
+    "metrics_collected": {
+      "otlp": { "http_endpoint": "127.0.0.1:4318" },
+      "mem": { "measurement": ["mem_used_percent"] },
+      "swap": { "measurement": ["swap_used_percent"] }
+    }
+  },
+  "logs": { "logs_collected": { "files": { "collect_list": [
+    { "file_path": "/var/log/claude-master/server.log", "log_group_name": "${log_group}", "log_stream_name": "{instance_id}" }
+  ] } } }
+}
+EOF2
+  if ! cmp -s /tmp/cwagent.json /etc/claude-master/cwagent.json || ! systemctl is-active --quiet amazon-cloudwatch-agent; then
+    cp /tmp/cwagent.json /tmp/cwagent.apply.json
+    if /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/tmp/cwagent.apply.json -s >/dev/null 2>&1; then
+      install -m 0644 /tmp/cwagent.json /etc/claude-master/cwagent.json
+    else
+      echo "WARNING: cloudwatch agent did not accept its configuration; it will be tried again at the next convergence" >&2
+    fi
+    rm -f /tmp/cwagent.apply.json
+  fi
+  rm -f /tmp/cwagent.json
+fi
+%{ endif ~}
+
+# ---------------------------------------------------------------- operator helpers
+# A login is interactive (paste a code); it runs as the service account so the profile belongs to the service.
+cat > /usr/local/bin/claude-master-login <<'EOF2'
+#!/bin/bash
+[ $# -eq 1 ] || { echo "usage: claude-master-login PROFILE" >&2; exit 2; }
+exec runuser -u claude-master -- env HOME=/var/lib/claude-master /usr/local/bin/claude-master login "$1"
+EOF2
+chmod 0755 /usr/local/bin/claude-master-login
+
+# Signs a client's certificate request (base64 on stdin) and prints the client certificate, then the CA certificate.
+cat > /usr/local/bin/claude-master-sign <<'EOF2'
+#!/bin/bash
+set -euo pipefail
+days=$${1:-30}
+tmp=$(mktemp -d); chmod 755 "$tmp"; trap 'rm -rf "$tmp"' EXIT
+base64 -d > "$tmp/request.csr"; chmod 644 "$tmp/request.csr"
+runuser -u claude-master -- env HOME=/var/lib/claude-master /usr/local/bin/claude-master issue --state-dir /var/lib/claude-master/state --request "$tmp/request.csr" --days "$days"
+cat /var/lib/claude-master/state/ca.pem
+EOF2
+chmod 0755 /usr/local/bin/claude-master-sign
+
+# Which logins exist, whether the server is up, and the installed binary against the pinned one.
+cat > /usr/local/bin/claude-master-status <<'EOF2'
+#!/bin/bash
+for p in ${join(" ", profiles)}; do
+  if [ -d "/var/lib/claude-master/.local/share/claude-master/profiles/$p/current" ]; then echo "login $p: present"; else echo "login $p: MISSING"; fi
+done
+echo "server: $(systemctl is-active claude-master-server)"
+echo "installed: $(sha256sum /usr/local/bin/claude-master | cut -c1-16)  pinned: ${substr(binary_sha256, 0, 16)}  (${release_tag})"
+EOF2
+chmod 0755 /usr/local/bin/claude-master-status

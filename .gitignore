@@ -31,6 +31,8 @@ auths/*
 # Documentation
 docs/*
 !docs/management-api-v8.md
+!docs/claude-master.md
+!docs/claude-master-aws.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md
