@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -233,10 +234,23 @@ func ChildEnvironment(environ, args []string, proxyURL, caPath, clientCert, clie
 		"VERCEL_AUTOMATION_BYPASS_SECRET": true,
 		"DISABLE_AUTOUPDATER":             true,
 	}
-	for _, arg := range args {
-		flag := strings.SplitN(arg, "=", 2)[0]
+	for i := 0; i < len(args); i++ {
+		flag, value, hasValue := strings.Cut(args[i], "=")
 		switch flag {
-		case "--settings", "--setting-sources", "--sdk-url", "--remote-control-session-id", "--claudeai-user-id", "--claudeai-org-id", "--api-key", "--base-url", "--cwd", "--worktree", "-w":
+		case "--settings":
+			// A settings file or inline JSON is allowed unless it is known to conflict (a launcher such as t-claude
+			// passes its hooks this way). Anything that cannot be read and understood is refused: its effect is unknown.
+			if !hasValue {
+				if i+1 >= len(args) {
+					return nil, errors.New("Claude launcher flag --settings needs a value")
+				}
+				i++
+				value = args[i]
+			}
+			if err := launcherSettingsConflict(value); err != nil {
+				return nil, err
+			}
+		case "--setting-sources", "--sdk-url", "--remote-control-session-id", "--claudeai-user-id", "--claudeai-org-id", "--api-key", "--base-url", "--cwd", "--worktree", "-w":
 			return nil, errors.New("Claude launcher flags cannot override master identity or provider routing")
 		}
 	}
@@ -264,4 +278,62 @@ func ChildEnvironment(environ, args []string, proxyURL, caPath, clientCert, clie
 		out = append(out, "CLAUDE_CODE_CLIENT_CERT="+clientCert, "CLAUDE_CODE_CLIENT_KEY="+clientKey)
 	}
 	return out, nil
+}
+
+// launcherSettingsLimit bounds how much of a --settings file is read.
+const launcherSettingsLimit = 1 << 20
+
+// conflictingSettingsKeys are Claude settings that change how the session logs in or reaches a provider, so a launcher
+// must not carry them: they would replace the master login or send inference somewhere the proxy does not control.
+var conflictingSettingsKeys = []string{
+	"apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh", "forceLoginMethod", "forceLoginOrgUUID",
+}
+
+// proxySettingsEnv are environment names that would reroute or re-trust the process proxy if a settings "env" block set them.
+var proxySettingsEnv = map[string]bool{
+	"HTTPS_PROXY": true, "https_proxy": true, "HTTP_PROXY": true, "http_proxy": true, "ALL_PROXY": true, "all_proxy": true,
+	"NO_PROXY": true, "no_proxy": true, "NODE_EXTRA_CA_CERTS": true, "CLAUDE_CODE_CLIENT_CERT": true, "CLAUDE_CODE_CLIENT_KEY": true,
+}
+
+// launcherSettingsConflict reports why a --settings value (a file path, or inline JSON as Claude also accepts) must be
+// refused. It names the setting, never its value. Settings that do not conflict, such as hooks, pass.
+func launcherSettingsConflict(value string) error {
+	var data []byte
+	if trimmed := strings.TrimSpace(value); strings.HasPrefix(trimmed, "{") {
+		data = []byte(trimmed)
+	} else {
+		f, err := os.Open(value)
+		if err != nil {
+			return errors.New("Claude launcher --settings value is not readable settings; refusing because its effect is unknown")
+		}
+		defer f.Close()
+		if info, err := f.Stat(); err != nil || !info.Mode().IsRegular() {
+			return errors.New("Claude launcher --settings value is not a settings file; refusing because its effect is unknown")
+		}
+		data, err = io.ReadAll(io.LimitReader(f, launcherSettingsLimit+1))
+		if err != nil || len(data) > launcherSettingsLimit {
+			return errors.New("Claude launcher --settings file is unreadable or too large; refusing because its effect is unknown")
+		}
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return errors.New("Claude launcher --settings is not a JSON object; refusing because its effect is unknown")
+	}
+	for _, key := range conflictingSettingsKeys {
+		if _, ok := settings[key]; ok {
+			return fmt.Errorf("Claude launcher settings cannot override master identity or provider routing (setting %s)", key)
+		}
+	}
+	if raw, ok := settings["env"]; ok {
+		var env map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &env); err != nil {
+			return errors.New("Claude launcher settings env is not an object; refusing because its effect is unknown")
+		}
+		for name := range env {
+			if forbiddenProviderEnv(name) || proxySettingsEnv[name] {
+				return fmt.Errorf("Claude launcher settings cannot override master identity or provider routing (env %s)", name)
+			}
+		}
+	}
+	return nil
 }
