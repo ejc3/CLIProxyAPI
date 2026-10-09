@@ -130,7 +130,7 @@ func TestForwarderURLCarriesTheTokenForLoopbackOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	password, _ := u.User.Password()
-	if u.Scheme != "http" || u.User.Username() != forwarderUser || password != f.token || len(f.token) != 64 {
+	if u.Scheme != "http" || u.User.Username() != forwarderUser || password != f.token || len(f.token) < 26 {
 		t.Fatalf("forwarder URL = %s://%s:<%d chars>@..., want http with the token", u.Scheme, u.User.Username(), len(password))
 	}
 	if host, _, _ := net.SplitHostPort(u.Host); host != "127.0.0.1" {
@@ -155,15 +155,15 @@ func TestForwarderTunnelsOtherHostsDirectlyWithoutAToken(t *testing.T) {
 func TestForwarderSendsAuthorizedAnthropicTrafficToTheMaster(t *testing.T) {
 	master := startForwarderTestEcho(t, true)
 	f := startForwarderForTest(t, master.dialer())
-	for _, authority := range []string{"api.anthropic.com:443", "API.Anthropic.com.:443"} {
+	for _, authority := range []string{"api.anthropic.com:443", "API.Anthropic.com.:443", "api.anthropic.com:0443"} {
 		resp, conn, reader := forwarderTestConnect(t, f, authority, f.token, "")
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("CONNECT %s = %d, want 200", authority, resp.StatusCode)
 		}
 		forwarderTestEchoes(t, conn, reader, "inference for "+authority)
 	}
-	if got := master.seen(); len(got) != 2 || got[0] != "CONNECT api.anthropic.com:443" || got[1] != got[0] {
-		t.Fatalf("the master saw %q, want two canonical CONNECTs", got)
+	if got := master.seen(); len(got) != 3 || got[0] != "CONNECT api.anthropic.com:443" || got[1] != got[0] || got[2] != got[0] {
+		t.Fatalf("the master saw %q, want three canonical CONNECTs", got)
 	}
 	forwarderTestDrains(t, f)
 }
@@ -208,25 +208,28 @@ func TestForwarderSendsAnthropicTrafficWithoutTheTokenDirect(t *testing.T) {
 		mu.Unlock()
 		return (&net.Dialer{}).DialContext(ctx, network, direct.addr())
 	}
-	for _, password := range []string{"", "wrong", f.token + "x", strings.ToUpper(f.token)} {
+	for _, password := range []string{"", "wrong", f.token + "x", strings.ToLower(f.token)} {
 		resp, conn, reader := forwarderTestConnect(t, f, "api.anthropic.com:443", password, "")
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("CONNECT = %d, want 200", resp.StatusCode)
 		}
 		forwarderTestEchoes(t, conn, reader, "direct")
 	}
-	// The right token on another port is not the master's either.
-	resp, conn, reader := forwarderTestConnect(t, f, "api.anthropic.com:8443", f.token, "")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("CONNECT = %d, want 200", resp.StatusCode)
+	// The right token on another port, or on a name with more than one trailing dot, is not the
+	// master's either; nor is a credential with two spaces after Basic.
+	for _, authority := range []string{"api.anthropic.com:8443", "api.anthropic.com..:443"} {
+		resp, conn, reader := forwarderTestConnect(t, f, authority, f.token, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("CONNECT %s = %d, want 200", authority, resp.StatusCode)
+		}
+		forwarderTestEchoes(t, conn, reader, "direct")
 	}
-	forwarderTestEchoes(t, conn, reader, "direct")
 	if got := master.seen(); len(got) != 0 {
 		t.Fatalf("the master saw %q without the token", got)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(dialled) != 5 || dialled[0] != "api.anthropic.com:443" || dialled[4] != "api.anthropic.com:8443" {
+	if len(dialled) != 6 || dialled[0] != "api.anthropic.com:443" || dialled[4] != "api.anthropic.com:8443" || dialled[5] != "api.anthropic.com..:443" {
 		t.Fatalf("dialled %q", dialled)
 	}
 }
@@ -255,7 +258,7 @@ func TestForwarderRejectsWhatIsNotATunnel(t *testing.T) {
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("GET = %d, want 405", resp.StatusCode)
 	}
-	for _, authority := range []string{"example.com", ":443", "example.com:0", "example.com:65536", "example.com:https"} {
+	for _, authority := range []string{"example.com", ":443", "example.com:0", "example.com:65536", "example.com:https", "api.anthropic.com:+443", "api.anthropic.com:-443"} {
 		resp, _, _ := forwarderTestConnect(t, f, authority, "", "")
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("CONNECT %q = %d, want 400", authority, resp.StatusCode)
@@ -362,7 +365,9 @@ func TestForwarderCloseEndsTunnelsEvenMidHandshake(t *testing.T) {
 			t.Errorf("the %s tunnel is still open after Close", name)
 		}
 	}
-	if _, err := net.Dial("tcp", f.listener.Addr().String()); err == nil {
+	// Accept on the closed listener, not a dial: the freed port may already be someone else's.
+	if conn, err := f.listener.Accept(); err == nil {
+		_ = conn.Close()
 		t.Error("the forwarder still accepts after Close")
 	}
 	if err := f.Close(); err != nil {
@@ -394,4 +399,101 @@ func TestForwarderReachesTheProxyWithTheLaunchCertificate(t *testing.T) {
 	if snapshot := p.Snapshot(); snapshot.ConnectAccepted != 1 || snapshot.InferenceRequests != 1 {
 		t.Fatalf("proxy snapshot = %+v, want one accepted CONNECT and one inference", snapshot)
 	}
+}
+
+func TestForwarderReadsCredentialsAsNetHTTPDoes(t *testing.T) {
+	master := startForwarderTestEcho(t, true)
+	direct := startForwarderTestEcho(t, false)
+	f := startForwarderForTest(t, master.dialer())
+	f.dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, direct.addr())
+	}
+	credential := base64.StdEncoding.EncodeToString([]byte(forwarderUser + ":" + f.token))
+	for header, wantMaster := range map[string]bool{
+		"Basic " + credential:  true,
+		"BASIC " + credential:  true,
+		"Basic  " + credential: false,
+		"Basic\t" + credential: false,
+		"Bearer " + f.token:    false,
+	} {
+		conn, err := net.Dial("tcp", f.listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		before := len(master.seen())
+		if _, err := fmt.Fprintf(conn, "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\nProxy-Authorization: %s\r\n\r\n", header); err != nil {
+			t.Fatal(err)
+		}
+		reader := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("%q: %v", header, err)
+		}
+		forwarderTestEchoes(t, conn, reader, "x")
+		if got := len(master.seen()) > before; got != wantMaster {
+			t.Errorf("Proxy-Authorization %q reached the master = %v, want %v", header[:7], got, wantMaster)
+		}
+		_ = conn.Close()
+	}
+}
+
+// forwarderTestReplyAfterEOF is a far end that reads until the client has finished sending, then
+// replies with how much it read: what a client that half-closes depends on.
+func startForwarderTestReplyAfterEOF(t *testing.T, expectConnect bool) string {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				reader := bufio.NewReader(conn)
+				if expectConnect {
+					if _, err := http.ReadRequest(reader); err != nil {
+						return
+					}
+					if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+						return
+					}
+				}
+				n, _ := io.Copy(io.Discard, reader)
+				_, _ = fmt.Fprintf(conn, "read %d bytes", n)
+			}()
+		}
+	}()
+	return listener.Addr().String()
+}
+
+func TestForwarderCarriesTheReplyAfterAClientHalfCloses(t *testing.T) {
+	directAddr := startForwarderTestReplyAfterEOF(t, false)
+	masterAddr := startForwarderTestReplyAfterEOF(t, true)
+	f := startForwarderForTest(t, plainUpstream(masterAddr))
+	for _, tc := range []struct{ authority, password string }{
+		{directAddr, ""},
+		{"api.anthropic.com:443", f.token},
+	} {
+		resp, conn, reader := forwarderTestConnect(t, f, tc.authority, tc.password, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("CONNECT %s = %d", tc.authority, resp.StatusCode)
+		}
+		if _, err := io.WriteString(conn, strings.Repeat("q", 100000)); err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+			t.Fatal(err)
+		}
+		reply, err := io.ReadAll(reader)
+		if err != nil || string(reply) != "read 100000 bytes" {
+			t.Fatalf("%s: after a half-close the reply was %q, %v", tc.authority, reply, err)
+		}
+	}
+	forwarderTestDrains(t, f)
 }
