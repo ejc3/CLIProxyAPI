@@ -272,6 +272,13 @@ can still start normally, and already-bound children retain their own origins.
 This lets independent fanout use separate subscriptions without guessing the
 owner of account-bound continuation data.
 
+When the selector refuses a request, the session sees the reason in claude-master's own
+words (`claude-master: subscription NAME does not serve model M (HTTP 404); ... Switch model
+with /model`) instead of the generic "Configured inference failed". The text is
+claude-master's: a profile name, a model, an HTTP status; never upstream text. Only a
+used-up weekly quota moves a conversation; an upstream error on the bound subscription
+(a model it does not serve, a 5xx) keeps it there, and the message says so.
+
 An account handoff is deferred while another generation for the same session is
 active. Clients must preserve chronological history under a session ID; replaying
 an old opaque branch after a completed handoff requires its own previously bound

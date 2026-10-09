@@ -712,6 +712,9 @@ func (s *backendSeriesSelector) Pick(ctx context.Context, provider, model string
 	picked, err := s.pick(ctx, provider, model, opts, auths)
 	sessionID, _ := backendSeriesSessionIDs(opts)
 	s.noteSelection(sessionID, model, picked, err, time.Since(started))
+	if err != nil {
+		noteBackendRefusal(ctx, err.Error())
+	}
 	return picked, err
 }
 
@@ -811,7 +814,7 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 				// subscription; only the weekly reserve policy may move clean work.
 				quota := s.currentQuotaLocked(boundID)
 				if backendAttemptFailed(ctx, boundID, backendAvailabilityModel(model, opts)) || (!strings.HasPrefix(boundID, "missing:") && !s.quotaBlockedLocked(boundID) && (!quota.known || quota.used < 1)) {
-					return nil, errors.New("the current Claude subscription is unavailable; no quota handoff is permitted")
+					return nil, s.boundUnavailableErrorLocked(ctx, boundID, backendAvailabilityModel(model, opts))
 				}
 			}
 			excludedAuthID = boundID
@@ -833,6 +836,27 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 		return s.bindSessionLocked(ctx, sessionID, picked)
 	}
 	return picked, nil
+}
+
+// boundUnavailableErrorLocked explains why a conversation stays on a subscription that cannot
+// take it right now. Only a used-up weekly quota moves a conversation; an upstream error on the
+// bound subscription (a model it does not serve, a 5xx) does not, so the person can act on it:
+// the subscription's own name, the model, the status, and what to do.
+func (s *backendSeriesSelector) boundUnavailableErrorLocked(ctx context.Context, boundID, model string) error {
+	name := boundID
+	if n := s.names[boundID]; n != "" {
+		name = n
+	}
+	if status, failed := backendAttemptStatus(ctx, boundID, model); failed {
+		if status == http.StatusNotFound {
+			return fmt.Errorf("subscription %s does not serve model %s (HTTP 404); the pool moves a conversation only for a used-up weekly quota, not for a model it cannot serve. Switch model with /model", name, model)
+		}
+		if status != 0 {
+			return fmt.Errorf("subscription %s answered HTTP %d for model %s; the pool moves a conversation only for a used-up weekly quota, not for an upstream error. Retry, or switch model with /model", name, status, model)
+		}
+		return fmt.Errorf("subscription %s failed this request for model %s; the pool moves a conversation only for a used-up weekly quota, not for an upstream error. Retry, or switch model with /model", name, model)
+	}
+	return fmt.Errorf("subscription %s is not available for model %s right now (cooling down after an upstream error, not out of weekly quota), so this conversation stays with it. Retry shortly, or switch model with /model", name, model)
 }
 
 func backendSeriesSessionIDs(opts coreexecutor.Options) (sessionID, parentSessionID string) {
@@ -1467,13 +1491,13 @@ func newBackendHandler(lifetime context.Context, opts BackendOptions, base *hand
 				if errMsg == nil {
 					writeBackendNativeSuccessStatus(ctx, c.Writer)
 				}
-				writeBackendNativeResult(c.Writer, response.Body, errMsg)
+				writeBackendNativeResult(c.Request.Context(), c.Writer, response.Body, errMsg)
 				return
 			}
 			payload, headers, errMsg := base.ExecuteCountWithAuthManager(ctx, "claude", model, raw, "")
 			observeBackendError(ctx, errMsg)
 			writeBackendProtocolHeaders(c.Writer.Header(), headers)
-			writeBackendResult(c.Writer, payload, errMsg)
+			writeBackendResult(c.Request.Context(), c.Writer, payload, errMsg)
 			return
 		}
 		var envelope struct {
@@ -1492,13 +1516,13 @@ func newBackendHandler(lifetime context.Context, opts BackendOptions, base *hand
 			if errMsg == nil {
 				writeBackendNativeSuccessStatus(ctx, c.Writer)
 			}
-			writeBackendNativeResult(c.Writer, response.Body, errMsg)
+			writeBackendNativeResult(c.Request.Context(), c.Writer, response.Body, errMsg)
 			return
 		}
 		payload, headers, errMsg := base.ExecuteWithAuthManager(ctx, "claude", model, raw, "")
 		observeBackendError(ctx, errMsg)
 		writeBackendProtocolHeaders(c.Writer.Header(), headers)
-		writeBackendResult(c.Writer, payload, errMsg)
+		writeBackendResult(c.Request.Context(), c.Writer, payload, errMsg)
 	}
 	router.POST("/v1/messages", dispatch)
 	router.POST("/v1/messages/count_tokens", dispatch)
@@ -1639,9 +1663,9 @@ func validateBackendMappedModel(raw []byte) error {
 	return nil
 }
 
-func writeBackendResult(w http.ResponseWriter, payload []byte, errMsg *interfaces.ErrorMessage) {
+func writeBackendResult(ctx context.Context, w http.ResponseWriter, payload []byte, errMsg *interfaces.ErrorMessage) {
 	if errMsg != nil {
-		writeBackendUpstreamError(w, errMsg)
+		writeBackendUpstreamError(ctx, w, errMsg)
 		return
 	}
 	if len(payload) >= 2 && payload[0] == 0x1f && payload[1] == 0x8b {
@@ -1664,9 +1688,9 @@ func writeBackendResult(w http.ResponseWriter, payload []byte, errMsg *interface
 	_, _ = w.Write(payload)
 }
 
-func writeBackendNativeResult(w http.ResponseWriter, payload []byte, errMsg *interfaces.ErrorMessage) {
+func writeBackendNativeResult(ctx context.Context, w http.ResponseWriter, payload []byte, errMsg *interfaces.ErrorMessage) {
 	if errMsg != nil {
-		writeBackendNativeUpstreamError(w, errMsg)
+		writeBackendNativeUpstreamError(ctx, w, errMsg)
 		return
 	}
 	_, _ = w.Write(payload)
@@ -1705,7 +1729,7 @@ func streamBackendResponse(ctx context.Context, w http.ResponseWriter, base *han
 			}
 			observeBackendError(ctx, errMsg)
 			if !started {
-				writeBackendUpstreamError(w, errMsg)
+				writeBackendUpstreamError(ctx, w, errMsg)
 			}
 			return
 		case chunk, open := <-data:
@@ -1742,7 +1766,7 @@ func streamBackendProtocolResponse(ctx context.Context, w http.ResponseWriter, f
 	stream, errMsg := base.ExecuteProtocolStreamWithAuthManager(ctx, backendProtocolRequest(model, raw, true))
 	if errMsg != nil {
 		observeBackendError(ctx, errMsg)
-		writeBackendNativeUpstreamError(w, errMsg)
+		writeBackendNativeUpstreamError(ctx, w, errMsg)
 		return
 	}
 	started := false
@@ -1786,7 +1810,7 @@ func streamBackendProtocolResponse(ctx context.Context, w http.ResponseWriter, f
 				streamErr := &interfaces.ErrorMessage{StatusCode: chunk.Err.StatusCode, Error: chunk.Err, Addon: chunk.Err.Headers}
 				observeBackendError(ctx, streamErr)
 				if !started {
-					writeBackendNativeUpstreamError(w, streamErr)
+					writeBackendNativeUpstreamError(ctx, w, streamErr)
 				}
 				return
 			}
@@ -1794,7 +1818,7 @@ func streamBackendProtocolResponse(ctx context.Context, w http.ResponseWriter, f
 	}
 }
 
-func writeBackendUpstreamError(w http.ResponseWriter, errMsg *interfaces.ErrorMessage) {
+func writeBackendUpstreamError(ctx context.Context, w http.ResponseWriter, errMsg *interfaces.ErrorMessage) {
 	if status, headers, body, ok := backendDirectErrorResponse(errMsg); ok {
 		writeBackendProtocolHeaders(w.Header(), headers)
 		w.WriteHeader(status)
@@ -1802,7 +1826,7 @@ func writeBackendUpstreamError(w http.ResponseWriter, errMsg *interfaces.ErrorMe
 		return
 	}
 	if errMsg == nil {
-		backendError(w, http.StatusBadGateway, "Configured inference failed; no fallback to the native master was attempted")
+		backendError(w, http.StatusBadGateway, backendFailureMessage(ctx))
 		return
 	}
 	writeBackendProtocolHeaders(w.Header(), errMsg.Addon)
@@ -1810,10 +1834,20 @@ func writeBackendUpstreamError(w http.ResponseWriter, errMsg *interfaces.ErrorMe
 	if status < 400 || status > 599 {
 		status = http.StatusBadGateway
 	}
-	backendError(w, status, "Configured inference failed; no fallback to the native master was attempted")
+	backendError(w, status, backendFailureMessage(ctx))
 }
 
-func writeBackendNativeUpstreamError(w http.ResponseWriter, errMsg *interfaces.ErrorMessage) {
+// backendFailureMessage is the client's error text when no upstream body is passed through: the
+// selector's own refusal when it made one (its text is claude-master's, never upstream text),
+// else the generic line.
+func backendFailureMessage(ctx context.Context) string {
+	if reason := backendRefusal(ctx); reason != "" {
+		return "claude-master: " + reason
+	}
+	return "Configured inference failed; no fallback to the native master was attempted"
+}
+
+func writeBackendNativeUpstreamError(ctx context.Context, w http.ResponseWriter, errMsg *interfaces.ErrorMessage) {
 	if status, headers, body, ok := backendDirectErrorResponse(errMsg); ok {
 		writeBackendNativeHeaders(w.Header(), headers)
 		w.WriteHeader(status)
@@ -1821,7 +1855,7 @@ func writeBackendNativeUpstreamError(w http.ResponseWriter, errMsg *interfaces.E
 		return
 	}
 	if errMsg == nil {
-		backendError(w, http.StatusBadGateway, "Configured inference failed; no fallback to the native master was attempted")
+		backendError(w, http.StatusBadGateway, backendFailureMessage(ctx))
 		return
 	}
 	writeBackendNativeHeaders(w.Header(), errMsg.Addon)
@@ -1829,7 +1863,7 @@ func writeBackendNativeUpstreamError(w http.ResponseWriter, errMsg *interfaces.E
 	if status < 400 || status > 599 {
 		status = http.StatusBadGateway
 	}
-	backendError(w, status, "Configured inference failed; no fallback to the native master was attempted")
+	backendError(w, status, backendFailureMessage(ctx))
 }
 
 func backendDirectErrorResponse(errMsg *interfaces.ErrorMessage) (int, http.Header, []byte, bool) {

@@ -3,6 +3,7 @@ package claudemaster
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,7 +17,8 @@ type backendAttemptKey struct{}
 // A stream result may arrive on a detached observer, so access is synchronized.
 type backendAttempt struct {
 	mu               sync.Mutex
-	failures         map[string]map[string]bool
+	failures         map[string]map[string]int // model key -> auth id -> upstream HTTP status (0 when none)
+	refusal          string                    // the selector's first refusal in this request, for the client's error
 	route            *backendRouteAttempt
 	pickedAt         time.Time // when an account was chosen: claude-master's own time ends here
 	count            bool
@@ -179,13 +181,58 @@ func recordBackendAttempt(ctx context.Context, result coreauth.Result) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.failures == nil {
-		state.failures = make(map[string]map[string]bool)
+		state.failures = make(map[string]map[string]int)
 	}
 	model := backendBlockedModelKey(result.Model)
 	if state.failures[model] == nil {
-		state.failures[model] = make(map[string]bool)
+		state.failures[model] = make(map[string]int)
 	}
-	state.failures[model][result.AuthID] = true
+	state.failures[model][result.AuthID] = result.Error.HTTPStatus
+}
+
+// backendAttemptStatus reports the upstream HTTP status of this request's failed attempt on
+// authID for model (0 when the failure carried none), and whether there was one.
+func backendAttemptStatus(ctx context.Context, authID, model string) (int, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	state, _ := ctx.Value(backendAttemptKey{}).(*backendAttempt)
+	if state == nil {
+		return 0, false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	for _, key := range []string{backendBlockedModelKey(model), ""} {
+		if status, ok := state.failures[key][authID]; ok {
+			return status, true
+		}
+	}
+	return 0, false
+}
+
+// noteBackendRefusal keeps the first reason the selector refused this request. The client's
+// error names it instead of the generic "configured inference failed": the reason is
+// claude-master's own text (a profile name, a model, an HTTP status), never upstream text.
+func noteBackendRefusal(ctx context.Context, reason string) {
+	state := backendRequestAttempt(ctx)
+	if state == nil || strings.TrimSpace(reason) == "" {
+		return
+	}
+	state.mu.Lock()
+	if state.refusal == "" {
+		state.refusal = reason
+	}
+	state.mu.Unlock()
+}
+
+func backendRefusal(ctx context.Context) string {
+	state := backendRequestAttempt(ctx)
+	if state == nil {
+		return ""
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.refusal
 }
 
 func backendAttemptFailed(ctx context.Context, authID, model string) bool {
