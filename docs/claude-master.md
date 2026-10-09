@@ -311,7 +311,10 @@ later request.
   login and provider settings `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh`, `forceLoginMethod`
   and `forceLoginOrgUUID`, or an `env` block that sets a provider variable (`ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`,
   `CLAUDE_CODE_USE_BEDROCK`, ...), a proxy variable (`HTTPS_PROXY`, `NO_PROXY`, ...) or `NODE_EXTRA_CA_CERTS`. The error
-  names the setting, never its value. A value that cannot be read as a settings object is refused, because its effect is
+  names the setting, never its value. `NODE_OPTIONS` is refused too, in settings and in the environment, with one
+  allowance: a value made only of V8 heap-size flags (`--max-old-space-size=N`, `--max-semi-space-size=N`) is kept, because
+  a project commonly caps its builds' memory that way and those flags cannot load code, change TLS trust or route traffic;
+  anything else in it (`--require`, `--import`, `--use-openssl-ca`, ...) stays refused. A value that cannot be read as a settings object is refused, because its effect is
   unknown. This is a guard against accidental or wrapper-injected redirection, not a defence against a user who can
   already run Claude directly.
 - The local proxy is an HTTPS listener that requires a client certificate; there is no password.

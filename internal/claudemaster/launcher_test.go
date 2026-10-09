@@ -190,6 +190,31 @@ func TestChildEnvironmentRejectsBypassConfiguration(t *testing.T) {
 	}
 }
 
+func TestChildEnvironmentKeepsHeapSizeNodeOptions(t *testing.T) {
+	env, err := ChildEnvironment([]string{"NODE_OPTIONS=--max-old-space-size=3072"}, nil, "proxy", "ca", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, entry := range env {
+		if entry == "NODE_OPTIONS=--max-old-space-size=3072" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("heap-size NODE_OPTIONS was dropped")
+	}
+	for _, value := range []string{"--max-old-space-size=3072 --require /tmp/sensitive-canary.js", "--use-openssl-ca"} {
+		if _, err := ChildEnvironment([]string{"NODE_OPTIONS=" + value}, nil, "proxy", "ca", "", ""); err == nil {
+			t.Errorf("accepted NODE_OPTIONS %q", value)
+		}
+	}
+	path := writeLauncherSettings(t, `{"env":{"NODE_OPTIONS":"--max-old-space-size=3072"}}`)
+	if _, err := ChildEnvironment(nil, []string{"--settings", path}, "proxy", "ca", "", ""); err != nil {
+		t.Fatalf("refused heap-size NODE_OPTIONS in --settings: %v", err)
+	}
+}
+
 func writeLauncherSettings(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "settings.json")
