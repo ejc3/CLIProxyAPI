@@ -190,6 +190,83 @@ func TestChildEnvironmentRejectsBypassConfiguration(t *testing.T) {
 	}
 }
 
+func writeLauncherSettings(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestChildEnvironmentAllowsSettingsThatDoNotConflict(t *testing.T) {
+	hooks := `{"hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","command":"/bin/true"}]}]},"preferredNotifChannel":"terminal_bell","env":{"HARMLESS_FLAG":"1"},"model":"sonnet"}`
+	path := writeLauncherSettings(t, hooks)
+	for _, args := range [][]string{{"--settings", path}, {"--settings=" + path}, {"--settings", hooks}, {"--settings=" + hooks}, {"-p", "x", "--settings", path, "--remote-control"}} {
+		if _, err := ChildEnvironment(nil, args, "proxy", "ca", "", ""); err != nil {
+			t.Errorf("refused harmless settings %v: %v", args[:1], err)
+		}
+	}
+}
+
+func TestChildEnvironmentRefusesSettingsKnownToConflict(t *testing.T) {
+	cases := map[string]string{
+		"apiKeyHelper":        `{"apiKeyHelper":"/bin/echo sensitive-canary"}`,
+		"awsAuthRefresh":      `{"awsAuthRefresh":"aws sso login"}`,
+		"awsCredentialExport": `{"awsCredentialExport":"x"}`,
+		"gcpAuthRefresh":      `{"gcpAuthRefresh":"x"}`,
+		"forceLoginMethod":    `{"forceLoginMethod":"console"}`,
+		"forceLoginOrgUUID":   `{"forceLoginOrgUUID":"00000000-0000-0000-0000-000000000000"}`,
+		"env base url":        `{"env":{"ANTHROPIC_BASE_URL":"https://sensitive-canary.invalid"}}`,
+		"env api key":         `{"env":{"ANTHROPIC_API_KEY":"sensitive-canary"}}`,
+		"env bedrock":         `{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}`,
+		"env https proxy":     `{"env":{"HTTPS_PROXY":"http://sensitive-canary.invalid:1"}}`,
+		"env no proxy":        `{"env":{"NO_PROXY":"*"}}`,
+		"env extra ca":        `{"env":{"NODE_EXTRA_CA_CERTS":"/tmp/sensitive-canary.pem"}}`,
+		"env node options":    `{"env":{"NODE_OPTIONS":"--require /tmp/sensitive-canary.js"}}`,
+		"conflict with hooks": `{"hooks":{},"apiKeyHelper":"x"}`,
+	}
+	for name, content := range cases {
+		for form, args := range map[string][]string{"file": {"--settings", writeLauncherSettings(t, content)}, "inline": {"--settings=" + content}} {
+			t.Run(name+"/"+form, func(t *testing.T) {
+				_, err := ChildEnvironment(nil, args, "proxy", "ca", "", "")
+				if err == nil {
+					t.Fatal("accepted conflicting settings")
+				}
+				if strings.Contains(err.Error(), "sensitive-canary") {
+					t.Fatal("a settings value leaked in the error")
+				}
+			})
+		}
+	}
+}
+
+func TestChildEnvironmentRefusesSettingsItCannotUnderstand(t *testing.T) {
+	dir := t.TempDir()
+	big := writeLauncherSettings(t, `{"padding":"`+strings.Repeat("x", launcherSettingsLimit)+`"}`)
+	for name, args := range map[string][]string{
+		"missing file":           {"--settings", filepath.Join(dir, "absent.json")},
+		"a directory":            {"--settings", dir},
+		"not json":               {"--settings", writeLauncherSettings(t, "not json")},
+		"json but not an object": {"--settings", writeLauncherSettings(t, `["x"]`)},
+		"env not an object":      {"--settings", writeLauncherSettings(t, `{"env":"x"}`)},
+		"too large":              {"--settings", big},
+		"no value":               {"--settings"},
+		"bare word":              {"--settings=canary"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ChildEnvironment(nil, args, "proxy", "ca", "", ""); err == nil {
+				t.Fatal("accepted settings it could not understand")
+			}
+		})
+	}
+	for _, flag := range []string{"--setting-sources", "--sdk-url=wss://bad", "--api-key=canary", "--base-url=https://bad", "--cwd=/x", "--worktree", "-w"} {
+		if _, err := ChildEnvironment(nil, []string{flag}, "proxy", "ca", "", ""); err == nil {
+			t.Errorf("accepted flag %s", flag)
+		}
+	}
+}
+
 func TestProcessCertificateOnlyTrustsAnthropicAndHasNoDiskKeys(t *testing.T) {
 	certs, err := newProcessCertificate()
 	if err != nil {

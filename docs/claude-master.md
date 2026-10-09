@@ -295,6 +295,16 @@ later request.
   The kernel releases the lock when its holder dies, so a crashed launcher cannot wedge the rest.
   Conversation routing records are one file per session and need no coordination. A Codex profile
   keeps the old rule of one launcher at a time.
+- **Launcher flags and Claude settings.** `run` and `connect` start Claude with the process proxy and the master login, so
+  they refuse launcher flags that would change them: `--setting-sources`, `--sdk-url`, `--api-key`, `--base-url`,
+  `--claudeai-user-id`, `--claudeai-org-id`, `--remote-control-session-id`, `--cwd`, `--worktree`. `--settings FILE` (or
+  inline JSON) is allowed, so a launcher can carry hooks and notification settings, **unless it is known to conflict**: the
+  login and provider settings `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh`, `forceLoginMethod`
+  and `forceLoginOrgUUID`, or an `env` block that sets a provider variable (`ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`,
+  `CLAUDE_CODE_USE_BEDROCK`, ...), a proxy variable (`HTTPS_PROXY`, `NO_PROXY`, ...) or `NODE_EXTRA_CA_CERTS`. The error
+  names the setting, never its value. A value that cannot be read as a settings object is refused, because its effect is
+  unknown. This is a guard against accidental or wrapper-injected redirection, not a defence against a user who can
+  already run Claude directly.
 - The local proxy is an HTTPS listener that requires a client certificate; there is no password.
   A launch makes a throwaway CA and one client certificate for its own Claude child, passed
   through `CLAUDE_CODE_CLIENT_CERT` / `CLAUDE_CODE_CLIENT_KEY`. The CA is trusted only by the
