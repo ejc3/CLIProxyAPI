@@ -5,8 +5,10 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -18,16 +20,21 @@ import (
 func TestClientErrorNamesTheSelectorsRefusal(t *testing.T) {
 	ctx := withBackendAttempt(context.Background())
 	noteBackendRefusal(ctx, &coreauth.Error{Code: "auth_unavailable", Message: "no auth available"})
-	noteBackendRefusal(ctx, errors.New("subscription alpha does not serve model claude-test-model (HTTP 404)"))
-	noteBackendRefusal(ctx, errors.New("a later, vaguer reason"))
+	noteBackendRefusal(ctx, backendRefuse(backendRefusalNotFound, "subscription alpha does not serve model claude-test-model (HTTP 404)"))
+	noteBackendRefusal(ctx, backendRefuse(backendRefusalUnavailable, "a later, vaguer reason"))
 	noteBackendRefusal(ctx, &coreauth.Error{Code: "auth_unavailable", Message: "no auth available"})
 	for name, write := range map[string]func(context.Context, http.ResponseWriter, *interfaces.ErrorMessage){"protocol": writeBackendUpstreamError, "native": writeBackendNativeUpstreamError} {
 		t.Run(name, func(t *testing.T) {
 			w := httptest.NewRecorder()
 			write(ctx, w, &interfaces.ErrorMessage{StatusCode: 503, Error: errors.New("private-upstream-error")})
 			body := w.Body.String()
-			if w.Code != 503 || !strings.Contains(body, "claude-master: subscription alpha does not serve model claude-test-model (HTTP 404)") {
-				t.Fatalf("refusal not surfaced: %d %s", w.Code, body)
+			// A not-found refusal is a 404 not_found_error, as Anthropic's would be, so the client stops
+			// instead of retrying a 503 ten times.
+			if w.Code != 404 || !strings.Contains(body, `"type":"not_found_error"`) || !strings.Contains(body, "claude-master: subscription alpha does not serve model claude-test-model (HTTP 404)") {
+				t.Fatalf("refusal not surfaced as Anthropic would: %d %s", w.Code, body)
+			}
+			if w.Header().Get("Claude-Master-Reason") == "" {
+				t.Fatal("the reason header is missing")
 			}
 			if strings.Contains(body, "later, vaguer") || strings.Contains(body, "no auth available") || strings.Contains(body, "private-upstream-error") || strings.Contains(body, "Configured inference failed") {
 				t.Fatalf("wrong text in the client error: %s", body)
@@ -74,5 +81,86 @@ func TestBoundSubscriptionRefusalNamesModelAndStatus(t *testing.T) {
 	}
 	if backendRefusal(ctx) != msg {
 		t.Fatalf("the refusal was not recorded for the client's error: %q", backendRefusal(ctx))
+	}
+}
+
+// Every pool subscription out of weekly quota: the session gets what Anthropic sends for a weekly
+// limit (429 rate_limit_error with the unified rate-limit headers and retry-after), so the client
+// shows its "weekly limit, resets at" and waits, instead of a 503 it retries at once.
+func TestQuotaRefusalLooksLikeAnthropicsWeeklyLimit(t *testing.T) {
+	ctx := withBackendAttempt(context.Background())
+	resetAt := time.Now().Add(90 * time.Hour).Truncate(time.Second)
+	noteBackendRefusal(ctx, &backendRefusalError{kind: backendRefusalQuota, reason: "ordered inference subscriptions are exhausted; no fallback is configured", resetAt: resetAt})
+	w := httptest.NewRecorder()
+	writeBackendNativeUpstreamError(ctx, w, &interfaces.ErrorMessage{StatusCode: 503, Error: errors.New("private-upstream-error")})
+	body := w.Body.String()
+	if w.Code != 429 || !strings.Contains(body, `"type":"rate_limit_error"`) || !strings.Contains(body, "would exceed your account's rate limit") {
+		t.Fatalf("quota refusal is not Anthropic's 429: %d %s", w.Code, body)
+	}
+	h := w.Header()
+	if h.Get("Anthropic-Ratelimit-Unified-Status") != "rejected" || h.Get("Anthropic-Ratelimit-Unified-Representative-Claim") != "seven_day" || h.Get("Anthropic-Ratelimit-Unified-Reset") != strconv.FormatInt(resetAt.Unix(), 10) || h.Get("X-Should-Retry") != "true" {
+		t.Fatalf("quota headers are not Anthropic's: %v", h)
+	}
+	if retry, err := strconv.Atoi(h.Get("Retry-After")); err != nil || retry < 89*3600 || retry > 91*3600 {
+		t.Fatalf("retry-after does not point at the reset: %q", h.Get("Retry-After"))
+	}
+	if strings.Contains(body, "private-upstream-error") || strings.Contains(body, "Configured inference failed") {
+		t.Fatalf("wrong text in the quota error: %s", body)
+	}
+}
+
+// An upstream error recorded in this request is relayed exactly, status, body and headers, even
+// though the pool refused afterwards: the client reacts to Anthropic's own answer.
+func TestRecordedUpstreamErrorIsRelayedExactly(t *testing.T) {
+	ctx := withBackendAttempt(context.Background())
+	noteBackendUpstreamError(ctx, backendTestUpstreamError{status: 404, headers: http.Header{"Request-Id": {"req_test"}, "X-Account": {"private-account"}}, body: []byte(`{"type":"error","error":{"type":"not_found_error","message":"model: claude-test-model"}}`)})
+	noteBackendRefusal(ctx, backendRefuse(backendRefusalNotFound, "subscription alpha does not serve model claude-test-model (HTTP 404)"))
+	for name, write := range map[string]func(context.Context, http.ResponseWriter, *interfaces.ErrorMessage){"protocol": writeBackendUpstreamError, "native": writeBackendNativeUpstreamError} {
+		t.Run(name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			write(ctx, w, &interfaces.ErrorMessage{StatusCode: 503, Error: errors.New("private-upstream-error")})
+			if w.Code != 404 || w.Body.String() != `{"type":"error","error":{"type":"not_found_error","message":"model: claude-test-model"}}` {
+				t.Fatalf("upstream error not relayed exactly: %d %s", w.Code, w.Body.String())
+			}
+			if w.Header().Get("Request-Id") != "req_test" {
+				t.Fatalf("request-id dropped: %v", w.Header())
+			}
+			if name == "protocol" && w.Header().Get("X-Account") != "" {
+				t.Fatalf("protocol path leaked a private header: %v", w.Header())
+			}
+		})
+	}
+}
+
+type backendTestUpstreamError struct {
+	status  int
+	headers http.Header
+	body    []byte
+}
+
+func (e backendTestUpstreamError) Error() string                { return "private upstream text" }
+func (e backendTestUpstreamError) StatusCode() int              { return e.status }
+func (e backendTestUpstreamError) ResponseHeaders() http.Header { return e.headers.Clone() }
+func (e backendTestUpstreamError) ResponseBody() []byte         { return append([]byte(nil), e.body...) }
+
+// A later request of a conversation bound to a subscription in cooldown makes no upstream call,
+// so the request itself has no upstream error; the one that caused the cooldown is remembered per
+// subscription and model and relayed again, as Anthropic would answer it again.
+func TestRememberedUpstreamErrorIsRelayedOnLaterRequests(t *testing.T) {
+	first := withBackendAttempt(context.Background())
+	noteBackendUpstreamErrorFor(first, "profile-memory", "claude-test-model", backendTestUpstreamError{status: 404, headers: http.Header{"Request-Id": {"req_first"}}, body: []byte(`{"type":"error","error":{"type":"not_found_error","message":"model: claude-test-model"}}`)})
+	later := withBackendAttempt(context.Background())
+	noteBackendRefusal(later, &backendRefusalError{kind: backendRefusalUnavailable, reason: "cooling down", authID: "profile-memory", model: "claude-test-model"})
+	w := httptest.NewRecorder()
+	writeBackendNativeUpstreamError(later, w, &interfaces.ErrorMessage{StatusCode: 503, Error: errors.New("private-upstream-error")})
+	if w.Code != 404 || !strings.Contains(w.Body.String(), `"type":"not_found_error"`) || w.Header().Get("Request-Id") != "req_first" {
+		t.Fatalf("remembered 404 not relayed: %d %s %v", w.Code, w.Body.String(), w.Header())
+	}
+	other := withBackendAttempt(context.Background())
+	noteBackendRefusal(other, &backendRefusalError{kind: backendRefusalUnavailable, reason: "cooling down", authID: "profile-memory", model: "claude-other-model"})
+	w = httptest.NewRecorder()
+	writeBackendNativeUpstreamError(other, w, &interfaces.ErrorMessage{StatusCode: 503, Error: errors.New("private-upstream-error")})
+	if w.Code != 529 || !strings.Contains(w.Body.String(), `"type":"overloaded_error"`) {
+		t.Fatalf("another model must not get the remembered 404: %d %s", w.Code, w.Body.String())
 	}
 }

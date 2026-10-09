@@ -512,13 +512,19 @@ func TestBackendSeriesRetriesConfirmedDrainThenStaysOnNextProfile(t *testing.T) 
 
 type backendSeriesNotFoundError struct{}
 
+const backendSeriesNotFoundBody = `{"type":"error","error":{"type":"not_found_error","message":"model: not served here"},"request_id":"req_series_404"}`
+
 func (backendSeriesNotFoundError) Error() string   { return "private not found body" }
 func (backendSeriesNotFoundError) StatusCode() int { return http.StatusNotFound }
+func (backendSeriesNotFoundError) ResponseHeaders() http.Header {
+	return http.Header{"Request-Id": {"req_series_404"}, "Content-Type": {"application/json"}}
+}
+func (backendSeriesNotFoundError) ResponseBody() []byte { return []byte(backendSeriesNotFoundBody) }
 
 // The 2026-10-09 outage as the session saw it: a conversation whose subscription answers 404 for
-// its model got "Configured inference failed … check status.claude.com". The refusal the selector
-// makes on the retry must reach the HTTP body in claude-master's words, through the real handler
-// (the writers must be handed the request's attempt context, not a bare one).
+// its model got "Configured inference failed … check status.claude.com". Through the real handler,
+// stream and not, the session must get Anthropic's 404 exactly, even though the pool refused on
+// the retry that followed (the writers must be handed the request's attempt context, not a bare one).
 func TestBackendSeriesRefusalReachesTheSessionBody(t *testing.T) {
 	model := t.Name() + "-model"
 	first, second := t.Name()+"-first", t.Name()+"-second"
@@ -527,7 +533,7 @@ func TestBackendSeriesRefusalReachesTheSessionBody(t *testing.T) {
 	manager := coreauth.NewManager(nil, selector, nil)
 	manager.SetRetryConfig(0, 0, 2)
 	setBackendSeriesResultPolicy(manager, selector)
-	manager.RegisterExecutor(capture)
+	manager.RegisterExecutor(withBackendUpstreamRecording(capture))
 	for _, authID := range []string{first, second} {
 		registry.GetGlobalRegistry().RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: backendAuthSelectionModel}})
 		if _, err := manager.Register(t.Context(), &coreauth.Auth{ID: authID, Provider: "claude", Status: coreauth.StatusActive, Metadata: map[string]any{"disable_cooling": false}}); err != nil {
@@ -542,25 +548,16 @@ func TestBackendSeriesRefusalReachesTheSessionBody(t *testing.T) {
 		req.Header.Set("X-Claude-Code-Session-Id", t.Name()+"-session")
 		handler.ServeHTTP(writer, req)
 		body := writer.Body.String()
-		if writer.Code == http.StatusOK {
-			t.Fatalf("stream=%t: a model the bound subscription cannot serve succeeded: %s", stream, body)
+		// Anthropic's own answer, exactly: its status, its body, its request id; not the pool's
+		// refusal that followed, not the generic line.
+		if writer.Code != http.StatusNotFound || body != backendSeriesNotFoundBody {
+			t.Fatalf("stream=%t: Anthropic's 404 was not relayed exactly: status=%d body=%s", stream, writer.Code, body)
 		}
-		for _, want := range []string{"claude-master: subscription " + first, model, "/model"} {
-			if !strings.Contains(body, want) {
-				t.Fatalf("stream=%t: the session body lacks %q: status=%d body=%s", stream, want, writer.Code, body)
-			}
+		if writer.Header().Get("Request-Id") != "req_series_404" {
+			t.Fatalf("stream=%t: request-id dropped: %v", stream, writer.Header())
 		}
-		// Non-stream: the 404 is on record when the scheduler asks again, so the reason names it. Stream:
-		// the retry asks before the failed attempt is recorded, so the reason is the cooldown variant; the
-		// instruction is the same either way.
-		if !strings.Contains(body, "404") && !strings.Contains(body, "cooling down") {
-			t.Fatalf("stream=%t: the session body names neither the status nor the cooldown: %s", stream, body)
-		}
-		if !stream && !strings.Contains(body, "404") {
-			t.Fatalf("the non-stream body must name the 404: %s", body)
-		}
-		if strings.Contains(body, "private not found body") || strings.Contains(body, "Configured inference failed") {
-			t.Fatalf("stream=%t: wrong text reached the session: %s", stream, body)
+		if backendRefusal(req.Context()) != "" {
+			t.Fatalf("stream=%t: the handler's refusal leaked onto the bare request context", stream)
 		}
 	}
 }
