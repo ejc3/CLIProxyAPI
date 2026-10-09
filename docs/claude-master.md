@@ -276,8 +276,12 @@ Errors reach the session exactly as Anthropic sends them, so the client reacts a
 to Anthropic. An upstream error response is relayed byte for byte (its status, its body, and
 the headers the client acts on: `request-id`, `retry-after`, `x-should-retry`,
 `anthropic-ratelimit-*`), including when the scheduler retried after it and the pool then
-refused: the last upstream error of the request is what the session gets. Only a refusal with
-no upstream error behind it is synthesized, in Anthropic's error shape, with the type and
+refused: the last upstream error of the request is what the session gets. A failure that is
+not a dead login (401) or a used-up quota (429) never benches the subscription: the scheduler
+underneath would otherwise keep a subscription off a model for twelve hours after one 404,
+and two 404s Anthropic did not repeat took the whole pool down twice on 2026-10-09. The next
+request of the same conversation goes to the same subscription; the server log records each
+upstream error's type and message. Only a refusal with no upstream error behind it is synthesized, in Anthropic's error shape, with the type and
 status the client would get from Anthropic for that situation: every subscription out of
 weekly quota is a 429 `rate_limit_error` with Anthropic's rate-limit text, the unified
 rate-limit headers and a `retry-after` pointing at the earliest reset; opaque state the pool

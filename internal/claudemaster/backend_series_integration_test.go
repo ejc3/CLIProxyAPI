@@ -51,6 +51,8 @@ type backendSeriesCapture struct {
 	drainAll   bool
 	failure    error
 	streamMode string
+	failOnce   bool // the drained profile fails its first call only: Anthropic's 2026-10-09 404s did not repeat
+	failed     bool
 }
 
 type backendSeriesBlockingHook struct {
@@ -92,7 +94,18 @@ func (e *backendSeriesCapture) selectedFailure() error {
 }
 
 func (e *backendSeriesCapture) shouldFail(auth *coreauth.Auth, model string) bool {
-	return (e.failModel == "" || e.failModel == model) && (e.drainAll || auth.ID == e.drained)
+	if !((e.failModel == "" || e.failModel == model) && (e.drainAll || auth.ID == e.drained)) {
+		return false
+	}
+	if e.failOnce {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if e.failed {
+			return false
+		}
+		e.failed = true
+	}
+	return true
 }
 
 func (e *backendSeriesCapture) Execute(_ context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
@@ -559,5 +572,47 @@ func TestBackendSeriesRefusalReachesTheSessionBody(t *testing.T) {
 		if backendRefusal(req.Context()) != "" {
 			t.Fatalf("stream=%t: the handler's refusal leaked onto the bare request context", stream)
 		}
+	}
+}
+
+// Anthropic answered a subscription's Opus request with a 404 that it did not repeat. The session
+// gets that 404 exactly; the NEXT request of the same conversation goes to the same subscription
+// and succeeds, because a failure that is not a dead login or a used-up quota benches nothing.
+func TestBackendSeriesDoesNotBenchASubscriptionOnAPassingFailure(t *testing.T) {
+	model := t.Name() + "-model"
+	first, second := t.Name()+"-first", t.Name()+"-second"
+	selector := &backendSeriesSelector{authIDs: []string{first, second}, provider: "claude"}
+	capture := &backendSeriesCapture{drained: first, failModel: model, failure: backendSeriesNotFoundError{}, failOnce: true}
+	manager := coreauth.NewManager(nil, selector, nil)
+	manager.SetRetryConfig(0, 0, 2)
+	setBackendSeriesResultPolicy(manager, selector)
+	manager.RegisterExecutor(withBackendUpstreamRecording(capture))
+	for _, authID := range []string{first, second} {
+		registry.GetGlobalRegistry().RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: backendAuthSelectionModel}})
+		if _, err := manager.Register(t.Context(), &coreauth.Auth{ID: authID, Provider: "claude", Status: coreauth.StatusActive, Metadata: map[string]any{"disable_cooling": false}}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	}
+	handler := newBackendHandler(t.Context(), BackendOptions{Provider: "claude", UseRequestModel: true}, handlers.NewBaseAPIHandlers(&config.SDKConfig{}, manager))
+	request := func() *httptest.ResponseRecorder {
+		writer := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hello"}]}`, model)))
+		req.Header.Set("X-Claude-Code-Session-Id", t.Name()+"-session")
+		handler.ServeHTTP(writer, req)
+		return writer
+	}
+	failed := request()
+	if failed.Code != http.StatusNotFound || failed.Body.String() != backendSeriesNotFoundBody {
+		t.Fatalf("the passing 404 was not relayed exactly: %d %s", failed.Code, failed.Body.String())
+	}
+	next := request()
+	if next.Code != http.StatusOK {
+		t.Fatalf("the next request of the conversation did not succeed: %d %s", next.Code, next.Body.String())
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if got := strings.Join(capture.calls, ","); got != first+","+first {
+		t.Fatalf("the subscription was benched or the conversation moved after a passing failure: calls=%v", capture.calls)
 	}
 }

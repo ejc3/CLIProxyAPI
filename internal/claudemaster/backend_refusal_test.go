@@ -143,24 +143,21 @@ func (e backendTestUpstreamError) StatusCode() int              { return e.statu
 func (e backendTestUpstreamError) ResponseHeaders() http.Header { return e.headers.Clone() }
 func (e backendTestUpstreamError) ResponseBody() []byte         { return append([]byte(nil), e.body...) }
 
-// A later request of a conversation bound to a subscription in cooldown makes no upstream call,
-// so the request itself has no upstream error; the one that caused the cooldown is remembered per
-// subscription and model and relayed again, as Anthropic would answer it again.
-func TestRememberedUpstreamErrorIsRelayedOnLaterRequests(t *testing.T) {
-	first := withBackendAttempt(context.Background())
-	noteBackendUpstreamErrorFor(first, "profile-memory", "claude-test-model", backendTestUpstreamError{status: 404, headers: http.Header{"Request-Id": {"req_first"}}, body: []byte(`{"type":"error","error":{"type":"not_found_error","message":"model: claude-test-model"}}`)})
-	later := withBackendAttempt(context.Background())
-	noteBackendRefusal(later, &backendRefusalError{kind: backendRefusalUnavailable, reason: "cooling down", authID: "profile-memory", model: "claude-test-model"})
-	w := httptest.NewRecorder()
-	writeBackendNativeUpstreamError(later, w, &interfaces.ErrorMessage{StatusCode: 503, Error: errors.New("private-upstream-error")})
-	if w.Code != 404 || !strings.Contains(w.Body.String(), `"type":"not_found_error"`) || w.Header().Get("Request-Id") != "req_first" {
-		t.Fatalf("remembered 404 not relayed: %d %s %v", w.Code, w.Body.String(), w.Header())
+// A failure that is not a dead login or a used-up quota is this request's: the scheduler must not
+// bench the subscription for it.
+func TestFailuresOtherThanLoginAndQuotaAreRequestScoped(t *testing.T) {
+	for status, want := range map[int]string{404: coreauth.ErrorCodeRequestScoped, 400: coreauth.ErrorCodeRequestScoped, 529: coreauth.ErrorCodeRequestScoped, 500: coreauth.ErrorCodeRequestScoped, 401: "", 429: ""} {
+		result := coreauth.Result{AuthID: "profile-a", Error: &coreauth.Error{HTTPStatus: status, Message: "private"}}
+		backendScopeFailureToRequest(&result)
+		if result.Error.Code != want {
+			t.Fatalf("status %d: code %q, want %q", status, result.Error.Code, want)
+		}
 	}
-	other := withBackendAttempt(context.Background())
-	noteBackendRefusal(other, &backendRefusalError{kind: backendRefusalUnavailable, reason: "cooling down", authID: "profile-memory", model: "claude-other-model"})
-	w = httptest.NewRecorder()
-	writeBackendNativeUpstreamError(other, w, &interfaces.ErrorMessage{StatusCode: 503, Error: errors.New("private-upstream-error")})
-	if w.Code != 529 || !strings.Contains(w.Body.String(), `"type":"overloaded_error"`) {
-		t.Fatalf("another model must not get the remembered 404: %d %s", w.Code, w.Body.String())
+	kept := coreauth.Result{AuthID: "profile-a", Error: &coreauth.Error{HTTPStatus: 404, Code: coreauth.ErrorCodeForceCooldown}}
+	backendScopeFailureToRequest(&kept)
+	if kept.Error.Code != coreauth.ErrorCodeForceCooldown {
+		t.Fatal("an explicit code was overwritten")
 	}
+	ok := coreauth.Result{AuthID: "profile-a", Success: true}
+	backendScopeFailureToRequest(&ok)
 }

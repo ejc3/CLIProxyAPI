@@ -2,12 +2,12 @@ package claudemaster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -110,7 +110,7 @@ func noteBackendUpstreamErrorFor(ctx context.Context, authID, model string, err 
 		return
 	}
 	record := &backendUpstreamError{status: status, headers: upstream.ResponseHeaders(), body: append([]byte(nil), upstream.ResponseBody()...)}
-	rememberBackendUpstreamError(authID, model, record)
+	logBackendUpstreamError(authID, model, record)
 	state := backendRequestAttempt(ctx)
 	if state == nil {
 		return
@@ -120,39 +120,22 @@ func noteBackendUpstreamErrorFor(ctx context.Context, authID, model string, err 
 	state.mu.Unlock()
 }
 
-// The last upstream error per subscription and model, kept for as long as the cooldown it caused
-// can last. A conversation bound to a subscription that answered 404 for its model is refused on
-// every later request without an upstream call; Anthropic would answer that 404 again, so the
-// session gets it again, exactly, instead of a refusal of the pool's own.
-const backendUpstreamMemoryTTL = time.Hour
-
-type backendUpstreamMemoryEntry struct {
-	at       time.Time
-	upstream *backendUpstreamError
-}
-
-var backendUpstreamMemory sync.Map // authID + "\x00" + model -> *backendUpstreamMemoryEntry
-
-func rememberBackendUpstreamError(authID, model string, upstream *backendUpstreamError) {
-	if authID == "" || upstream == nil {
-		return
+// logBackendUpstreamError names what Anthropic answered, so a failure can be read from the
+// server log: the subscription's runtime id, the model, the status and the error's own type and
+// message (the first 200 characters). An error message is not a token, a body or a URL.
+func logBackendUpstreamError(authID, model string, upstream *backendUpstreamError) {
+	var body struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
-	backendUpstreamMemory.Store(authID+"\x00"+backendBlockedModelKey(model), &backendUpstreamMemoryEntry{at: time.Now(), upstream: upstream})
-}
-
-func rememberedBackendUpstreamError(authID, model string) *backendUpstreamError {
-	if authID == "" {
-		return nil
+	_ = json.Unmarshal(upstream.body, &body)
+	message := body.Error.Message
+	if len(message) > 200 {
+		message = message[:200]
 	}
-	value, ok := backendUpstreamMemory.Load(authID + "\x00" + backendBlockedModelKey(model))
-	if !ok {
-		return nil
-	}
-	entry, _ := value.(*backendUpstreamMemoryEntry)
-	if entry == nil || time.Since(entry.at) > backendUpstreamMemoryTTL {
-		return nil
-	}
-	return entry.upstream
+	lg().Warn("upstream error", "auth", authID, "model", model, "status", upstream.status, "type", body.Error.Type, "message", message)
 }
 
 func backendUpstreamErrorFrom(ctx context.Context) *backendUpstreamError {
@@ -241,15 +224,6 @@ func writeBackendFailure(ctx context.Context, w http.ResponseWriter, fallbackSta
 	}
 	var refusal *backendRefusalError
 	if err := backendRefusalErrorFrom(ctx); errors.As(err, &refusal) && refusal != nil {
-		if remembered := rememberedBackendUpstreamError(refusal.authID, refusal.model); remembered != nil {
-			headers(w.Header(), remembered.headers)
-			if w.Header().Get("Content-Type") == "" {
-				w.Header().Set("Content-Type", "application/json")
-			}
-			w.WriteHeader(remembered.status)
-			_, _ = w.Write(remembered.body)
-			return
-		}
 		if refusal.kind == backendRefusalQuota {
 			writeBackendQuotaHeaders(w.Header(), refusal.resetAt)
 		}
@@ -321,4 +295,3 @@ func (s *backendSeriesSelector) quotaRefusalLocked(reason string) error {
 }
 
 var _ = strings.TrimSpace
-var _ sync.Mutex
