@@ -234,6 +234,9 @@ func forwarderGymRun(t *testing.T, mode string) {
 		return nil, fmt.Errorf("the gym has no host %s", address)
 	}
 	t.Cleanup(func() { forwarderDial = previous })
+	var started []*localForwarder
+	forwarderStarted = func(f *localForwarder) { started = append(started, f) }
+	t.Cleanup(func() { forwarderStarted = nil })
 
 	// The fake Claude: this test binary, through a `claude` shim on PATH.
 	self, err := os.Executable()
@@ -322,11 +325,21 @@ func forwarderGymRun(t *testing.T, mode string) {
 	}
 	dialMu.Unlock()
 
-	// The forwarder went away with Claude.
-	if conn, err := net.Dial("tcp", got["claude_forwarder"]); err == nil {
-		_ = conn.Close()
-		t.Errorf("the forwarder at %s still accepts after Claude exited", got["claude_forwarder"])
+	// The launch started one forwarder, the one Claude was given, and it went away with Claude:
+	// its listener is closed (checked by Accept, not a dial to a port that may be reused) and it
+	// tracks no connection.
+	if len(started) != 1 || started[0].listener.Addr().String() != got["claude_forwarder"] {
+		t.Fatalf("the launch started %d forwarders; Claude was given %s", len(started), got["claude_forwarder"])
 	}
+	if conn, err := started[0].listener.Accept(); err == nil {
+		_ = conn.Close()
+		t.Errorf("the forwarder still accepts after Claude exited")
+	}
+	started[0].mu.Lock()
+	if n := len(started[0].conns); n != 0 {
+		t.Errorf("the forwarder tracks %d connections after Claude exited", n)
+	}
+	started[0].mu.Unlock()
 }
 
 // TestForwarderGymHelper is the fake Claude and the commands it runs; outside the gym it does nothing.

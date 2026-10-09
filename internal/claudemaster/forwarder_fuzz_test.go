@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,79 +21,79 @@ import (
 	"time"
 )
 
-// forwarderPairListener hands the forwarder in-memory Unix socket pairs instead of TCP
-// connections, so fuzzing uses no ports (a TCP connection per input exhausts the ephemeral range)
-// while a client can still half-close its side.
-type forwarderPairListener struct {
-	conns chan net.Conn
-	done  chan struct{}
-	once  sync.Once
-}
-
-func newForwarderPairListener() *forwarderPairListener {
-	return &forwarderPairListener{conns: make(chan net.Conn), done: make(chan struct{})}
-}
-
-func (l *forwarderPairListener) Accept() (net.Conn, error) {
-	select {
-	case conn := <-l.conns:
-		return conn, nil
-	case <-l.done:
-		return nil, net.ErrClosed
-	}
-}
-
-func (l *forwarderPairListener) Close() error {
-	l.once.Do(func() { close(l.done) })
-	return nil
-}
-
-func (l *forwarderPairListener) Addr() net.Addr { return &net.UnixAddr{Name: "pair", Net: "unix"} }
-
-// dial returns the client end of a new pair whose server end the forwarder accepts.
-func (l *forwarderPairListener) dial(t *testing.T) *net.UnixConn {
+// forwarderTestPair returns the two ends of an in-memory Unix socket pair: fuzzing on these uses no
+// ports (a TCP connection per input exhausts the ephemeral range), and either end can half-close.
+// Like package net, it holds ForkLock and sets close-on-exec, so a child started meanwhile (the gym's
+// fake Claude) cannot inherit an end and keep it from reaching EOF.
+func forwarderTestPair(t *testing.T) (*net.UnixConn, *net.UnixConn) {
 	t.Helper()
+	syscall.ForkLock.RLock()
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err == nil {
+		syscall.CloseOnExec(fds[0])
+		syscall.CloseOnExec(fds[1])
+	}
+	syscall.ForkLock.RUnlock()
 	if err != nil {
 		t.Fatal(err)
 	}
-	ends := make([]net.Conn, 2)
+	ends := make([]*net.UnixConn, 2)
 	for i, fd := range fds {
 		file := os.NewFile(uintptr(fd), "forwarder-pair")
-		ends[i], err = net.FileConn(file)
+		conn, err := net.FileConn(file)
 		_ = file.Close()
 		if err != nil {
 			t.Fatal(err)
 		}
+		ends[i] = conn.(*net.UnixConn)
 	}
-	select {
-	case l.conns <- ends[1]:
-	case <-l.done:
-		t.Fatal("the pair listener is closed")
-	}
-	return ends[0].(*net.UnixConn)
+	return ends[0], ends[1]
 }
 
-// forwarderOracleRoutesToMaster is an independent statement of the routing rule: only a CONNECT to
-// api.anthropic.com:443 whose first Proxy-Authorization is Basic with exactly the token reaches the
-// claude-master proxy.
+// forwarderTestFarEnd answers like a far end: as the master it first answers the CONNECT; then it
+// sends a one-byte banner and echoes until the forwarder half-closes.
+func forwarderTestFarEnd(conn *net.UnixConn, banner byte, master bool) {
+	defer func() { _ = conn.Close() }()
+	reader := bufio.NewReader(conn)
+	if master {
+		if _, err := http.ReadRequest(reader); err != nil {
+			return
+		}
+		if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+			return
+		}
+	}
+	if _, err := conn.Write([]byte{banner}); err != nil {
+		return
+	}
+	_, _ = io.Copy(conn, reader)
+}
+
+// forwarderOracleRoutesToMaster states the routing rule independently of the forwarder: a CONNECT
+// whose port is the number 443 and whose host is api.anthropic.com (any case, at most one trailing
+// dot), carrying the token as the password of Basic credentials as net/http reads them.
 func forwarderOracleRoutesToMaster(r *http.Request, token string) bool {
 	if r.Method != http.MethodConnect {
 		return false
 	}
 	host, port, err := net.SplitHostPort(r.RequestURI)
-	if err != nil || port != "443" || strings.TrimRight(strings.ToLower(host), ".") != masterAPIHost {
-		return false
-	}
-	value := r.Header.Get("Proxy-Authorization")
-	if len(value) < 6 || !strings.EqualFold(value[:6], "basic ") {
-		return false
-	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value[6:]))
 	if err != nil {
 		return false
 	}
-	_, password, ok := strings.Cut(string(decoded), ":")
+	if n, err := strconv.ParseUint(port, 10, 16); err != nil || n != 443 {
+		return false
+	}
+	switch strings.ToLower(host) {
+	case "api.anthropic.com", "api.anthropic.com.":
+	default:
+		return false
+	}
+	// net/http's own Basic parser, fed the first Proxy-Authorization.
+	credentials := &http.Request{Header: http.Header{}}
+	if value := r.Header.Values("Proxy-Authorization"); len(value) > 0 {
+		credentials.Header.Set("Authorization", value[0])
+	}
+	_, password, ok := credentials.BasicAuth()
 	return ok && password == token
 }
 
@@ -118,6 +119,8 @@ func FuzzForwarderRequest(f *testing.F) {
 		"CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Bearer TOKEN\r\n\r\n",
 		"CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: x\r\nProxy-Authorization: basic !!!\r\n\r\n",
 		"CONNECT api.anthropic.com:8443 HTTP/1.1\r\nHost: x\r\n" + auth("TOKEN") + "\r\n",
+		"CONNECT api.anthropic.com:0443 HTTP/1.1\r\nHost: x\r\n" + auth("TOKEN") + "\r\nafter",
+		"CONNECT example.com:443 HTTP/1.1\r\nHost: x\r\n\r\nbytes the far end must echo back",
 		"CONNECT api.anthropic.com.evil:443 HTTP/1.1\r\nHost: x\r\n" + auth("TOKEN") + "\r\n",
 		"CONNECT [::1]:443 HTTP/1.1\r\nHost: x\r\n\r\n",
 		"CONNECT example.com:0 HTTP/1.1\r\nHost: x\r\n\r\n",
@@ -133,23 +136,25 @@ func FuzzForwarderRequest(f *testing.F) {
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
 		var masterDials, directDials atomic.Int32
-		pairs := newForwarderPairListener()
-		fw, err := serveLocalForwarder(pairs, func(context.Context) (net.Conn, error) {
+		pairs := &proxyListener{connections: make(chan net.Conn), done: make(chan struct{}), addr: &net.UnixAddr{Name: "pair", Net: "unix"}}
+		fw := serveLocalForwarder(pairs, func(context.Context) (net.Conn, error) {
 			masterDials.Add(1)
-			return nil, errors.New("the fuzz master refuses")
+			near, far := forwarderTestPair(t)
+			go forwarderTestFarEnd(far, 'M', true)
+			return near, nil
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
 		fw.dial = func(context.Context, string, string) (net.Conn, error) {
 			directDials.Add(1)
-			return nil, errors.New("the fuzz internet refuses")
+			near, far := forwarderTestPair(t)
+			go forwarderTestFarEnd(far, 'D', false)
+			return near, nil
 		}
 		credential := base64.StdEncoding.EncodeToString([]byte(forwarderUser + ":" + fw.token))
 		data = bytes.ReplaceAll(data, []byte("TOKENB64"), []byte(credential))
 		data = bytes.ReplaceAll(data, []byte("TOKEN"), []byte(fw.token))
 
-		conn := pairs.dial(t)
+		conn, server := forwarderTestPair(t)
+		pairs.connections <- server
 		_ = conn.SetDeadline(time.Now().Add(10 * time.Second)) // a stuck exchange fails, it does not hang
 		_, _ = conn.Write(data)
 		_ = conn.CloseWrite()
@@ -167,8 +172,11 @@ func FuzzForwarderRequest(f *testing.F) {
 			t.Fatalf("answered %q to %q", response, data)
 		}
 		allowed := false
-		if r, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(data))); err == nil {
+		var rest []byte
+		reader := bufio.NewReader(bytes.NewReader(data))
+		if r, err := http.ReadRequest(reader); err == nil {
 			allowed = forwarderOracleRoutesToMaster(r, fw.token)
+			rest, _ = io.ReadAll(reader) // what the client sent after its request
 		}
 		if masterDials.Load() > 0 && !allowed {
 			t.Fatalf("reached the claude-master proxy for %q", data)
@@ -178,6 +186,26 @@ func FuzzForwarderRequest(f *testing.F) {
 		}
 		if masterDials.Load()+directDials.Load() > 1 {
 			t.Fatalf("one request dialled %d times", masterDials.Load()+directDials.Load())
+		}
+		// net/http may refuse a request before the forwarder sees it (a bad header, say); the
+		// forwarder's own answers are 200, 405, "invalid CONNECT authority" and 502.
+		established := []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
+		ownAnswer := bytes.HasPrefix(response, established) || bytes.HasPrefix(response, []byte("HTTP/1.1 405 ")) ||
+			bytes.Contains(response, []byte("invalid CONNECT authority")) || bytes.HasPrefix(response, []byte("HTTP/1.1 502 "))
+		if allowed && ownAnswer && masterDials.Load() != 1 {
+			t.Fatalf("an authorized request %q did not reach the claude-master proxy: %q", data, response)
+		}
+		// A tunnel carries everything the client sent after its request, and the client's
+		// half-close, to the far end its request names, and the far end's whole reply back.
+		if bytes.HasPrefix(response, established) {
+			banner := byte('D')
+			if masterDials.Load() == 1 {
+				banner = 'M'
+			}
+			want := append(append(append([]byte(nil), established...), banner), rest...)
+			if !bytes.Equal(response, want) {
+				t.Fatalf("tunnel for %q returned %q, want %q", data, response, want)
+			}
 		}
 		fw.mu.Lock()
 		defer fw.mu.Unlock()
@@ -393,7 +421,10 @@ func forwarderChaos(t *testing.T, seed uint64, steps int) {
 			_ = conn.Close()
 		case 5: // a client that writes half a message and leaves
 			k := kinds[rng.IntN(len(kinds))]
-			_, tun := open(step, k.authority, k.token, nil)
+			status, tun := open(step, k.authority, k.token, nil)
+			if status != http.StatusOK {
+				t.Fatalf("%s: status %d", where(step, k.authority), status)
+			}
 			expectBanner(step, k.authority, tun, k.banner)
 			_, _ = tun.conn.Write(make([]byte, rng.IntN(4096)+1))
 			_ = tun.conn.Close()
@@ -504,7 +535,8 @@ func forwarderChaos(t *testing.T, seed uint64, steps int) {
 	if tracked != 0 {
 		t.Fatalf("seed %d: %d connections tracked after Close", seed, tracked)
 	}
-	if conn, err := net.Dial("tcp", fw.listener.Addr().String()); err == nil {
+	// Accept on the closed listener, not a dial: the freed port may already be someone else's.
+	if conn, err := fw.listener.Accept(); err == nil {
 		_ = conn.Close()
 		t.Fatalf("seed %d: the forwarder accepts after Close", seed)
 	}
