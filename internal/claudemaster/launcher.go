@@ -260,10 +260,11 @@ func ChildEnvironment(environ, args []string, proxyURL, caPath, clientCert, clie
 		if !ok {
 			continue
 		}
-		if forbiddenProviderEnv(key) && strings.TrimSpace(value) != "" {
+		allowed := allowedNodeOptions(key, value)
+		if forbiddenProviderEnv(key) && strings.TrimSpace(value) != "" && !allowed {
 			return nil, errors.New("clear custom Claude provider, login-directory, or Node bypass settings before launching")
 		}
-		if removed[key] || forbiddenProviderEnv(key) {
+		if removed[key] || (forbiddenProviderEnv(key) && !allowed) {
 			continue
 		}
 		// The selected inference login is held by the backend, never passed into the native master.
@@ -329,7 +330,11 @@ func launcherSettingsConflict(value string) error {
 		if err := json.Unmarshal(raw, &env); err != nil {
 			return errors.New("Claude launcher settings env is not an object; refusing because its effect is unknown")
 		}
-		for name := range env {
+		for name, value := range env {
+			var text string
+			if json.Unmarshal(value, &text) == nil && allowedNodeOptions(name, text) {
+				continue
+			}
 			if forbiddenProviderEnv(name) || proxySettingsEnv[name] {
 				return fmt.Errorf("Claude launcher settings cannot override master identity or provider routing (env %s)", name)
 			}
