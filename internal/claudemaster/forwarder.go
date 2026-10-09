@@ -55,6 +55,16 @@ func startLocalForwarder(upstream upstreamDialer) (*localForwarder, error) {
 	if err != nil {
 		return nil, errors.New("cannot bind the local forwarder")
 	}
+	return serveLocalForwarder(listener, upstream)
+}
+
+// serveLocalForwarder serves on listener, which it owns from here on.
+func serveLocalForwarder(listener net.Listener, upstream upstreamDialer) (*localForwarder, error) {
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		_ = listener.Close()
+		return nil, errors.New("cannot create the forwarder token")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &localForwarder{
 		listener: listener, token: rand.Text(), upstream: upstream,
