@@ -566,6 +566,10 @@ func TestProxyControlRouteInventory(t *testing.T) {
 		{"GET", "/api/claude_cli_profile", true},
 		{"POST", "/api/claude_cli_feedback", true},
 		{"POST", "/api/claude_code/unknown", false},
+		{"GET", "/api/web/domain_info", true},
+		{"POST", "/api/web/domain_info", false},
+		{"GET", "/api/web/domain_info/extra", false},
+		{"GET", "/api/web/fetch", false},
 	} {
 		if got := proxyControlPath(test.method, test.path); got != test.allowed {
 			t.Errorf("%s %s allowed=%v, expected %v", test.method, test.path, got, test.allowed)
@@ -743,5 +747,26 @@ func TestProxySnapshotDistinguishesConnectFromTLSRequests(t *testing.T) {
 	snapshot := p.Snapshot()
 	if snapshot.ConnectAccepted != 1 || snapshot.APIRequests != 0 || snapshot.InferenceRequests != 0 || snapshot.ControlRequests != 0 || snapshot.ActiveConnections != 1 {
 		t.Fatalf("incomplete TLS handshake was counted as an API request: %+v", snapshot)
+	}
+}
+
+// WebFetch asks api.anthropic.com whether a domain may be fetched before fetching it. Through
+// claude-master that question goes to Anthropic as a control request, never to inference.
+func TestProxyRelaysTheWebFetchDomainCheck(t *testing.T) {
+	var seen string
+	control := proxyTestTransport(func(r *http.Request) (*http.Response, error) {
+		seen = r.Method + " " + r.URL.Host + r.URL.Path + "?" + r.URL.RawQuery
+		return proxyTestResponse(http.StatusOK, `{"domain":"example.com","can_fetch":true}`), nil
+	})
+	p, client, _ := proxyTestStart(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("the domain check hit inference") }), control)
+	resp, body := proxyTestRequest(t, client, http.MethodGet, "/api/web/domain_info?domain=example.com", "", http.Header{"User-Agent": {"claude-cli/test"}})
+	if resp.StatusCode != http.StatusOK || body != `{"domain":"example.com","can_fetch":true}` {
+		t.Fatalf("domain check = %d %q", resp.StatusCode, body)
+	}
+	if seen != "GET api.anthropic.com/api/web/domain_info?domain=example.com" {
+		t.Fatalf("Anthropic saw %q", seen)
+	}
+	if snapshot := p.Snapshot(); snapshot.ControlRequests != 1 || snapshot.BlockedRequests != 0 || snapshot.InferenceRequests != 0 {
+		t.Fatalf("snapshot = %+v, want one control request", snapshot)
 	}
 }
