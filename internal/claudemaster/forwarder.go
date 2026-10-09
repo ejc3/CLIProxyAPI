@@ -24,6 +24,10 @@ type upstreamDialer func(ctx context.Context) (net.Conn, error)
 // forwarderUser is the user name in the forwarder's proxy URL; only the password is checked.
 const forwarderUser = "claude-master"
 
+// forwarderDial reaches a tunnel's far end directly. The forwarder gym replaces it to stand in
+// for the internet.
+var forwarderDial = (&net.Dialer{}).DialContext
+
 // localForwarder is the proxy Claude is given: plain HTTP on a loopback port of this box. A CONNECT
 // to api.anthropic.com that carries this launch's token goes on to the claude-master proxy; every
 // other CONNECT is dialled from this box and relayed blind. So the commands, hooks and servers Claude
@@ -54,7 +58,7 @@ func startLocalForwarder(upstream upstreamDialer) (*localForwarder, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &localForwarder{
 		listener: listener, token: rand.Text(), upstream: upstream,
-		dial: (&net.Dialer{}).DialContext, ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{}),
+		dial: forwarderDial, ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{}),
 	}
 	f.server = &http.Server{
 		Handler: http.HandlerFunc(f.handle), BaseContext: func(net.Listener) context.Context { return ctx },
