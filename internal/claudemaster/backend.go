@@ -1229,6 +1229,15 @@ func setBackendResultPolicy(manager *coreauth.Manager, selector *backendSeriesSe
 				result.RouteModel = requestedModel
 			}
 		}
+		// The scheduler underneath is built for pools of API keys and benches a credential after a
+		// failure: twelve hours for a 404, thirty minutes for a 403. For three family subscriptions
+		// that is wrong: on 2026-10-09 two 404s that Anthropic did not repeat benched a subscription
+		// for Opus and, with another in its reserve band and the third out of quota, left the pool
+		// with no one to serve, twice in one day. Only two things move work off a subscription: its
+		// weekly quota is used up (a 429, which the selector tracks itself) or its login is dead (a
+		// 401, which the shared executor refreshes itself). Every other failure is this request's,
+		// relayed to the session exactly as Anthropic sent it, for the client to retry or not.
+		backendScopeFailureToRequest(&result)
 		recordBackendAttempt(ctx, result)
 		if result.Success {
 			commitBackendRouteAttempt(ctx, result.AuthID)
@@ -1248,6 +1257,19 @@ func setBackendResultPolicy(manager *coreauth.Manager, selector *backendSeriesSe
 		}
 		return result
 	}))
+}
+
+// backendScopeFailureToRequest marks a failed result as request-scoped unless it is a dead
+// login (401) or a used-up quota (429), so the scheduler does not bench the subscription.
+func backendScopeFailureToRequest(result *coreauth.Result) {
+	if result == nil || result.Success || result.Error == nil || result.Error.Code != "" {
+		return
+	}
+	switch result.Error.HTTPStatus {
+	case http.StatusUnauthorized, http.StatusTooManyRequests:
+		return
+	}
+	result.Error.Code = coreauth.ErrorCodeRequestScoped
 }
 
 func setBackendSeriesResultPolicy(manager *coreauth.Manager, selector *backendSeriesSelector) {
