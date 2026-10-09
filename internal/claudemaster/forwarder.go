@@ -28,6 +28,10 @@ const forwarderUser = "claude-master"
 // for the internet.
 var forwarderDial = (&net.Dialer{}).DialContext
 
+// forwarderStarted, when set, is told of each forwarder a launch starts; the gym uses it to check
+// the forwarder is closed when Claude exits.
+var forwarderStarted func(*localForwarder)
+
 // localForwarder is the proxy Claude is given: plain HTTP on a loopback port of this box. A CONNECT
 // to api.anthropic.com that carries this launch's token goes on to the claude-master proxy; every
 // other CONNECT is dialled from this box and relayed blind. So the commands, hooks and servers Claude
@@ -55,16 +59,11 @@ func startLocalForwarder(upstream upstreamDialer) (*localForwarder, error) {
 	if err != nil {
 		return nil, errors.New("cannot bind the local forwarder")
 	}
-	return serveLocalForwarder(listener, upstream)
+	return serveLocalForwarder(listener, upstream), nil
 }
 
 // serveLocalForwarder serves on listener, which it owns from here on.
-func serveLocalForwarder(listener net.Listener, upstream upstreamDialer) (*localForwarder, error) {
-	secret := make([]byte, 32)
-	if _, err := rand.Read(secret); err != nil {
-		_ = listener.Close()
-		return nil, errors.New("cannot create the forwarder token")
-	}
+func serveLocalForwarder(listener net.Listener, upstream upstreamDialer) *localForwarder {
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &localForwarder{
 		listener: listener, token: rand.Text(), upstream: upstream,
@@ -76,7 +75,10 @@ func serveLocalForwarder(listener net.Listener, upstream upstreamDialer) (*local
 	}
 	f.wg.Add(1)
 	go func() { defer f.wg.Done(); _ = f.server.Serve(listener) }()
-	return f, nil
+	if forwarderStarted != nil {
+		forwarderStarted(f)
+	}
+	return f
 }
 
 // URL carries the token, a private capability: it goes into Claude's environment only, never into
