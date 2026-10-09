@@ -44,6 +44,8 @@ type LaunchOptions struct {
 	BackupAPIKeyEnv string
 	ModelMap        map[string]string
 	Diagnostics     io.Writer
+	// SnapshotInterval is how often the quota snapshot is logged (default 5 minutes, negative: never).
+	SnapshotInterval time.Duration
 }
 
 // BackupAPIKeyEnvironment is the dedicated optional final-backup credential source.
@@ -164,17 +166,18 @@ func LaunchProfilesWithOptions(ctx context.Context, profiles []Profile, args []s
 func newInferenceBackend(ctx context.Context, profiles []Profile, opts LaunchOptions) (*Backend, error) {
 	if len(profiles) == 1 && opts.BackupAPIKey == "" {
 		profile := profiles[0]
-		return NewBackend(ctx, BackendOptions{AuthDir: profile.AuthDir, Provider: profile.Provider, AuthID: profile.AuthID, UseRequestModel: true, ModelMap: opts.ModelMap})
+		return NewBackend(ctx, BackendOptions{AuthDir: profile.AuthDir, Provider: profile.Provider, AuthID: profile.AuthID, UseRequestModel: true, ModelMap: opts.ModelMap, Name: profile.Name})
 	}
 	credentials := make([]BackendCredential, 0, len(profiles))
 	for _, profile := range profiles {
-		credentials = append(credentials, BackendCredential{AuthDir: profile.AuthDir, Provider: profile.Provider, AuthID: profile.AuthID})
+		credentials = append(credentials, BackendCredential{AuthDir: profile.AuthDir, Provider: profile.Provider, AuthID: profile.AuthID, Name: profile.Name})
 	}
-	return NewBackendSeries(ctx, BackendSeriesOptions{Credentials: credentials, BackupAPIKey: opts.BackupAPIKey, ModelMap: opts.ModelMap})
+	return NewBackendSeries(ctx, BackendSeriesOptions{Credentials: credentials, BackupAPIKey: opts.BackupAPIKey, ModelMap: opts.ModelMap, SnapshotInterval: opts.SnapshotInterval})
 }
 
 // runNativeChild runs the native Claude with its prepared environment and returns its exit code.
 func runNativeChild(ctx context.Context, bin string, args, env []string) (int, error) {
+	lg().Info("native Claude starting")
 	child := exec.CommandContext(ctx, bin, args...)
 	child.Cancel = func() error { return child.Process.Signal(syscall.SIGTERM) }
 	// This bounds process shutdown only; inference streams have no post-connect wall-clock timeout.
@@ -188,10 +191,12 @@ func runNativeChild(ctx context.Context, bin string, args, env []string) (int, e
 			if code < 0 {
 				code = 130
 			}
+			lg().Info("native Claude exited", "code", code)
 			return code, nil
 		}
 		return 1, errors.New("native Claude could not start")
 	}
+	lg().Info("native Claude exited", "code", 0)
 	return 0, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"sync"
+	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -17,6 +18,7 @@ type backendAttempt struct {
 	mu               sync.Mutex
 	failures         map[string]map[string]bool
 	route            *backendRouteAttempt
+	pickedAt         time.Time // when an account was chosen: claude-master's own time ends here
 	count            bool
 	cancelRegistered bool
 }
@@ -72,6 +74,9 @@ func recordBackendRouteAttempt(ctx context.Context, selector *backendSeriesSelec
 		return
 	}
 	state.route = &backendRouteAttempt{selector: selector, sessionID: sessionID, authID: authID, route: route, active: true}
+	if state.pickedAt.IsZero() {
+		state.pickedAt = time.Now()
+	}
 	if selector.activeRoutes == nil {
 		selector.activeRoutes = make(map[string]map[string]int)
 	}
