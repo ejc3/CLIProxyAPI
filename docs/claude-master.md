@@ -536,6 +536,7 @@ from its credential file name (those carry the account's email address).
 | `claude_master.proxy.overhead` {profile} | histogram ms | claude-master's own added time (request in to account chosen) |
 | `claude_master.inference.duration_quantile` {profile, quantile 0.5/0.95/0.99} | gauge ms | recent p50/p95/p99, so CloudWatch can chart percentiles |
 | `claude_master.inference.errors` {profile, status, client_account} | counter | Anthropic errors by status |
+| `claude_master.inference.tokens` {profile, type}, `.tokens.by_client_account` {client_account, type}, `.tokens.by_client` {client, type} | counter | tokens each subscription (or `api-backup`) served, each user used and each box carried; `type` is `input`, `output`, `cache_read` or `cache_creation` (input excludes the cache fields, output includes thinking), from the usage Anthropic reports in each successful response |
 | `claude_master.inference.request_bytes`, `.response_bytes` {profile} | histogram | sizes |
 | `claude_master.quota.used_fraction`, `.resets_in_seconds`, `.rate_limited_for_seconds`, `.band` {profile} | gauge | each subscription's weekly allowance, when it resets, any cooldown, band (0 ok, 1 reserve, 2 exhausted, -1 unknown) |
 | `claude_master.quota.five_hour.used_fraction`, `.five_hour.resets_in_seconds` {profile} | gauge | each subscription's five-hour window from the usage poll (about once a minute, idle or not); 0 once the window has reset, and no countdown while no window is open |
@@ -564,5 +565,10 @@ kept; at most 256 unlabelled accounts are kept; everything else is `other` (or `
 accounts are bounded by your labels file. A client cannot create series, or put text of its own in a metric or
 a log, by choosing a model or an account.
 
-Not exported: token counts per request (the stream is forwarded untouched and never parsed), tokens, bodies, URLs,
-account ids, upstream error text.
+**Token counts** are read from the usage Anthropic reports in each successful response, on the bytes' way to the
+client, without changing them: in a stream, `message_start` and then the cumulative `message_delta`; in a JSON
+answer, its `usage` object. Only usage-sized stream lines and the last 64 KiB of a JSON answer are held while
+reading. `count_tokens` is a question, not consumption, and is not counted. The paid API-key backup's tokens are
+under `profile=api-backup`, so its cost can be derived.
+
+Not exported: credentials, bodies, URLs, account ids, upstream error text.
