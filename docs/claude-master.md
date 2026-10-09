@@ -279,8 +279,22 @@ later request.
 - Profiles live under `~/.local/share/claude-master/profiles/` in private directories.
   OAuth refresh persistence uses atomic replacement. A complete staged refresh
   left by an interrupted write is recovered while holding the profile lock.
-- A launcher holds an exclusive lock on every profile in its pool until shutdown. Two
-  concurrent launchers therefore need disjoint profile sets.
+- Any number of launchers (one per Claude Code window) may use the same profiles at once. A
+  launch holds each profile SHARED until shutdown; only a login needs it alone. A subscription
+  login rotates on every refresh and the previous access token stops working immediately, so the
+  launchers coordinate through the credential file, which is the single source of truth:
+  - a refresh runs under an exclusive lock (`auth.refresh.lock`, beside the auth directory) and
+    first re-reads the file. If another launcher already rotated, it adopts that credential and
+    does not call Anthropic;
+  - every request notices a newer saved credential (one `stat`) and uses it;
+  - a 401 adopts a newer saved credential, or rotates under the lock (at most once per 30 seconds
+    per launcher), then retries once before any response is exposed;
+  - a save never writes older tokens over newer ones;
+  - the usage poll is served from a short-lived cache file (`auth.usage`, 45 s) when another
+    launcher fetched it, so N launchers make about one usage request a minute per account.
+  The kernel releases the lock when its holder dies, so a crashed launcher cannot wedge the rest.
+  Conversation routing records are one file per session and need no coordination. A Codex profile
+  keeps the old rule of one launcher at a time.
 - The local CONNECT proxy uses a random process-only credential. Its temporary CA is
   trusted only by the child through `NODE_EXTRA_CA_CERTS`; it is not installed in the
   system trust store. Leaf certificates renew on new handshakes without interrupting
