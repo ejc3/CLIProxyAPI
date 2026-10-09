@@ -64,6 +64,9 @@ type instruments struct {
 	inferenceByModel  metric.Int64Counter
 	inferenceByClient metric.Int64Counter
 	inferenceErrors   metric.Int64Counter
+	tokens            metric.Int64Counter
+	tokensByAccount   metric.Int64Counter
+	tokensByClient    metric.Int64Counter
 	picks             metric.Int64Counter
 	switches          metric.Int64Counter
 	backup            metric.Int64Counter
@@ -176,6 +179,9 @@ func buildInstruments(m metric.Meter, labels map[string]string) *instruments {
 	i.inferenceByModel = counter("claude_master.inference.requests.by_model", "Inference requests by model and status class")
 	i.inferenceByClient = counter("claude_master.inference.requests.by_client", "Inference requests by client (the connecting box) and client account")
 	i.inferenceErrors = counter("claude_master.inference.errors", "Inference requests that ended in an error status, by profile, status and client account")
+	i.tokens = counter("claude_master.inference.tokens", "Tokens by profile and type (input, output, cache_read, cache_creation), from the responses' usage")
+	i.tokensByAccount = counter("claude_master.inference.tokens.by_client_account", "Tokens by client account and type")
+	i.tokensByClient = counter("claude_master.inference.tokens.by_client", "Tokens by client (the connecting box) and type")
 	i.picks = counter("claude_master.routing.picks", "Routing decisions by chosen profile")
 	i.switches = counter("claude_master.routing.switches", "Conversations moved to another account, by from, to and reason")
 	i.backup = counter("claude_master.routing.backup_requests", "Requests served by the paid API-key backup")
@@ -375,6 +381,32 @@ type requestObservation struct {
 	ReqBytes   int64
 	RespBytes  int64
 	RateLimits http.Header // the upstream response headers
+	Tokens     tokenCounts // the usage the response reported, when HasTokens
+	HasTokens  bool
+}
+
+// observeTokens counts one request's tokens. Like the request metrics, each axis (profile, user
+// account, client) is its own projection with the token type.
+func observeTokens(profile, client, account string, counts tokenCounts) {
+	t := tm()
+	ctx := context.Background()
+	for _, kind := range []struct {
+		name  string
+		count int64
+	}{
+		{"input", counts.input},
+		{"output", counts.output},
+		{"cache_read", counts.cacheRead},
+		{"cache_creation", counts.cacheCreation},
+	} {
+		if kind.count <= 0 {
+			continue
+		}
+		typ := attribute.String("type", kind.name)
+		t.tokens.Add(ctx, kind.count, metric.WithAttributes(attribute.String("profile", profile), typ))
+		t.tokensByAccount.Add(ctx, kind.count, metric.WithAttributes(attribute.String("client_account", account), typ))
+		t.tokensByClient.Add(ctx, kind.count, metric.WithAttributes(attribute.String("client", client), typ))
+	}
 }
 
 func observeRequest(o requestObservation) {
@@ -401,6 +433,9 @@ func observeRequest(o requestObservation) {
 	t.inference.Add(ctx, 1, metric.WithAttributes(profile, account, class))
 	t.inferenceByModel.Add(ctx, 1, metric.WithAttributes(model, class))
 	t.inferenceByClient.Add(ctx, 1, metric.WithAttributes(client, account))
+	if o.HasTokens {
+		observeTokens(o.Profile, o.Client, o.Account, o.Tokens)
+	}
 	if o.Status >= 400 || o.Status == 0 {
 		t.inferenceErrors.Add(ctx, 1, metric.WithAttributes(profile, attribute.String("status", strconv.Itoa(o.Status)), account))
 	}

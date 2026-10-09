@@ -13,6 +13,7 @@ import (
 type meteredWriter struct {
 	gin.ResponseWriter
 	firstWrite time.Time
+	usage      usageScanner // the token usage in the body, read as it is written
 }
 
 func newMeteredWriter(w gin.ResponseWriter) *meteredWriter { return &meteredWriter{ResponseWriter: w} }
@@ -23,10 +24,27 @@ func (w *meteredWriter) mark() {
 	}
 }
 
-func (w *meteredWriter) Write(b []byte) (int, error) { w.mark(); return w.ResponseWriter.Write(b) }
+func (w *meteredWriter) Write(b []byte) (int, error) {
+	w.mark()
+	n, err := w.ResponseWriter.Write(b)
+	w.observeBody(b[:max(n, 0)])
+	return n, err
+}
+
 func (w *meteredWriter) WriteString(s string) (int, error) {
 	w.mark()
-	return w.ResponseWriter.WriteString(s)
+	n, err := w.ResponseWriter.WriteString(s)
+	w.observeBody([]byte(s[:max(n, 0)]))
+	return n, err
+}
+
+// observeBody feeds what reached the client to the usage scanner, which decides on the first
+// write, once the status and content type are final, whether and how to read the body.
+func (w *meteredWriter) observeBody(b []byte) {
+	if w.usage.mode == usageUndecided {
+		w.usage.start(w.Status(), w.Header().Get("Content-Type"))
+	}
+	w.usage.write(b)
 }
 func (w *meteredWriter) WriteHeaderNow() { w.mark(); w.ResponseWriter.WriteHeaderNow() }
 func (w *meteredWriter) Flush()          { w.mark(); w.ResponseWriter.Flush() }
@@ -53,6 +71,7 @@ func finishRequest(c *gin.Context, ctx context.Context, opts BackendOptions, w *
 	if !w.firstWrite.IsZero() {
 		obs.TTFB = w.firstWrite.Sub(started)
 	}
+	obs.Tokens, obs.HasTokens = w.usage.result()
 	if attempt := backendRequestAttempt(ctx); attempt != nil {
 		attempt.mu.Lock()
 		route, pickedAt := attempt.route, attempt.pickedAt
