@@ -2,6 +2,7 @@ package claudemaster
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -18,7 +19,8 @@ type backendAttemptKey struct{}
 type backendAttempt struct {
 	mu               sync.Mutex
 	failures         map[string]map[string]int // model key -> auth id -> upstream HTTP status (0 when none)
-	refusal          string                    // the selector's first refusal in this request, for the client's error
+	refusal          string                    // the selector's refusal in this request, for the client's error
+	refusalGeneric   bool                      // the refusal is a bare core error; a specific one replaces it
 	route            *backendRouteAttempt
 	pickedAt         time.Time // when an account was chosen: claude-master's own time ends here
 	count            bool
@@ -210,20 +212,50 @@ func backendAttemptStatus(ctx context.Context, authID, model string) (int, bool)
 	return 0, false
 }
 
-// noteBackendRefusal keeps the first reason the selector refused this request. The client's
-// error names it instead of the generic "configured inference failed": the reason is
-// claude-master's own text (a profile name, a model, an HTTP status), never upstream text.
-func noteBackendRefusal(ctx context.Context, reason string) {
+// noteBackendRefusal keeps the reason the selector refused this request, for the client's error
+// in place of the generic "configured inference failed". The reason is claude-master's own text
+// (a profile name, a model, an HTTP status), never upstream text. A request can be refused more
+// than once (the scheduler asks again after an attempt fails): the first SPECIFIC refusal wins,
+// and a bare core error ("auth_unavailable: no auth available") only fills an empty slot and is
+// replaced by a specific one. Observed 2026-10-09: a bound subscription in model cooldown made
+// the core's generic error come first and the session saw that instead of the reason.
+func noteBackendRefusal(ctx context.Context, err error) {
 	state := backendRequestAttempt(ctx)
-	if state == nil || strings.TrimSpace(reason) == "" {
+	if state == nil || err == nil || strings.TrimSpace(err.Error()) == "" {
 		return
 	}
+	generic := backendGenericRefusal(err)
 	state.mu.Lock()
-	if state.refusal == "" {
-		state.refusal = reason
+	switch {
+	case state.refusal == "":
+		state.refusal, state.refusalGeneric = err.Error(), generic
+	case state.refusalGeneric && !generic:
+		state.refusal, state.refusalGeneric = err.Error(), false
 	}
 	state.mu.Unlock()
 }
+
+// backendGenericRefusal reports a core auth error (auth_unavailable, auth_not_found, a model
+// cooldown) as opposed to a reason the selector wrote itself.
+func backendGenericRefusal(err error) bool {
+	var explained *backendExplainedRefusal
+	if errors.As(err, &explained) {
+		return false
+	}
+	var authErr *coreauth.Error
+	return errors.As(err, &authErr)
+}
+
+// backendExplainedRefusal is a core error with the selector's reason in front of it: the reason
+// is what the session reads, the wrapped core error is what the scheduler keeps deciding by
+// (cooldowns, retries), so explaining a refusal changes nothing about routing.
+type backendExplainedRefusal struct {
+	reason string
+	cause  error
+}
+
+func (e *backendExplainedRefusal) Error() string { return e.reason }
+func (e *backendExplainedRefusal) Unwrap() error { return e.cause }
 
 func backendRefusal(ctx context.Context) string {
 	state := backendRequestAttempt(ctx)

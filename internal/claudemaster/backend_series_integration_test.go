@@ -509,3 +509,58 @@ func TestBackendSeriesRetriesConfirmedDrainThenStaysOnNextProfile(t *testing.T) 
 		}
 	}
 }
+
+type backendSeriesNotFoundError struct{}
+
+func (backendSeriesNotFoundError) Error() string   { return "private not found body" }
+func (backendSeriesNotFoundError) StatusCode() int { return http.StatusNotFound }
+
+// The 2026-10-09 outage as the session saw it: a conversation whose subscription answers 404 for
+// its model got "Configured inference failed … check status.claude.com". The refusal the selector
+// makes on the retry must reach the HTTP body in claude-master's words, through the real handler
+// (the writers must be handed the request's attempt context, not a bare one).
+func TestBackendSeriesRefusalReachesTheSessionBody(t *testing.T) {
+	model := t.Name() + "-model"
+	first, second := t.Name()+"-first", t.Name()+"-second"
+	selector := &backendSeriesSelector{authIDs: []string{first, second}, provider: "claude"}
+	capture := &backendSeriesCapture{drained: first, failModel: model, failure: backendSeriesNotFoundError{}}
+	manager := coreauth.NewManager(nil, selector, nil)
+	manager.SetRetryConfig(0, 0, 2)
+	setBackendSeriesResultPolicy(manager, selector)
+	manager.RegisterExecutor(capture)
+	for _, authID := range []string{first, second} {
+		registry.GetGlobalRegistry().RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: backendAuthSelectionModel}})
+		if _, err := manager.Register(t.Context(), &coreauth.Auth{ID: authID, Provider: "claude", Status: coreauth.StatusActive, Metadata: map[string]any{"disable_cooling": false}}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	}
+	handler := newBackendHandler(t.Context(), BackendOptions{Provider: "claude", UseRequestModel: true}, handlers.NewBaseAPIHandlers(&config.SDKConfig{}, manager))
+	for _, stream := range []bool{false, true} {
+		writer := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(fmt.Sprintf(`{"model":%q,"stream":%t,"messages":[{"role":"user","content":"hello"}]}`, model, stream)))
+		req.Header.Set("X-Claude-Code-Session-Id", t.Name()+"-session")
+		handler.ServeHTTP(writer, req)
+		body := writer.Body.String()
+		if writer.Code == http.StatusOK {
+			t.Fatalf("stream=%t: a model the bound subscription cannot serve succeeded: %s", stream, body)
+		}
+		for _, want := range []string{"claude-master: subscription " + first, model, "/model"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("stream=%t: the session body lacks %q: status=%d body=%s", stream, want, writer.Code, body)
+			}
+		}
+		// Non-stream: the 404 is on record when the scheduler asks again, so the reason names it. Stream:
+		// the retry asks before the failed attempt is recorded, so the reason is the cooldown variant; the
+		// instruction is the same either way.
+		if !strings.Contains(body, "404") && !strings.Contains(body, "cooling down") {
+			t.Fatalf("stream=%t: the session body names neither the status nor the cooldown: %s", stream, body)
+		}
+		if !stream && !strings.Contains(body, "404") {
+			t.Fatalf("the non-stream body must name the 404: %s", body)
+		}
+		if strings.Contains(body, "private not found body") || strings.Contains(body, "Configured inference failed") {
+			t.Fatalf("stream=%t: wrong text reached the session: %s", stream, body)
+		}
+	}
+}

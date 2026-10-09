@@ -713,7 +713,7 @@ func (s *backendSeriesSelector) Pick(ctx context.Context, provider, model string
 	sessionID, _ := backendSeriesSessionIDs(opts)
 	s.noteSelection(sessionID, model, picked, err, time.Since(started))
 	if err != nil {
-		noteBackendRefusal(ctx, err.Error())
+		noteBackendRefusal(ctx, err)
 	}
 	return picked, err
 }
@@ -789,6 +789,11 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 							return s.bindInheritedSessionLocked(ctx, sessionID, parentSessionID, picked)
 						}
 						return s.bindSessionLocked(ctx, sessionID, picked)
+					}
+					// The core refused the bound subscription (a model cooldown, an attempt that failed in
+					// this request): say which subscription, which model and why, in front of its error.
+					if err != nil && backendGenericRefusal(err) {
+						err = &backendExplainedRefusal{reason: s.boundUnavailableErrorLocked(ctx, boundID, backendAvailabilityModel(model, opts)).Error(), cause: err}
 					}
 					return picked, err
 				}
@@ -1491,13 +1496,13 @@ func newBackendHandler(lifetime context.Context, opts BackendOptions, base *hand
 				if errMsg == nil {
 					writeBackendNativeSuccessStatus(ctx, c.Writer)
 				}
-				writeBackendNativeResult(c.Request.Context(), c.Writer, response.Body, errMsg)
+				writeBackendNativeResult(ctx, c.Writer, response.Body, errMsg)
 				return
 			}
 			payload, headers, errMsg := base.ExecuteCountWithAuthManager(ctx, "claude", model, raw, "")
 			observeBackendError(ctx, errMsg)
 			writeBackendProtocolHeaders(c.Writer.Header(), headers)
-			writeBackendResult(c.Request.Context(), c.Writer, payload, errMsg)
+			writeBackendResult(ctx, c.Writer, payload, errMsg)
 			return
 		}
 		var envelope struct {
@@ -1516,13 +1521,13 @@ func newBackendHandler(lifetime context.Context, opts BackendOptions, base *hand
 			if errMsg == nil {
 				writeBackendNativeSuccessStatus(ctx, c.Writer)
 			}
-			writeBackendNativeResult(c.Request.Context(), c.Writer, response.Body, errMsg)
+			writeBackendNativeResult(ctx, c.Writer, response.Body, errMsg)
 			return
 		}
 		payload, headers, errMsg := base.ExecuteWithAuthManager(ctx, "claude", model, raw, "")
 		observeBackendError(ctx, errMsg)
 		writeBackendProtocolHeaders(c.Writer.Header(), headers)
-		writeBackendResult(c.Request.Context(), c.Writer, payload, errMsg)
+		writeBackendResult(ctx, c.Writer, payload, errMsg)
 	}
 	router.POST("/v1/messages", dispatch)
 	router.POST("/v1/messages/count_tokens", dispatch)

@@ -17,8 +17,10 @@ import (
 // still gets the generic line and never its text.
 func TestClientErrorNamesTheSelectorsRefusal(t *testing.T) {
 	ctx := withBackendAttempt(context.Background())
-	noteBackendRefusal(ctx, "subscription alpha does not serve model claude-test-model (HTTP 404)")
-	noteBackendRefusal(ctx, "a later, vaguer reason")
+	noteBackendRefusal(ctx, &coreauth.Error{Code: "auth_unavailable", Message: "no auth available"})
+	noteBackendRefusal(ctx, errors.New("subscription alpha does not serve model claude-test-model (HTTP 404)"))
+	noteBackendRefusal(ctx, errors.New("a later, vaguer reason"))
+	noteBackendRefusal(ctx, &coreauth.Error{Code: "auth_unavailable", Message: "no auth available"})
 	for name, write := range map[string]func(context.Context, http.ResponseWriter, *interfaces.ErrorMessage){"protocol": writeBackendUpstreamError, "native": writeBackendNativeUpstreamError} {
 		t.Run(name, func(t *testing.T) {
 			w := httptest.NewRecorder()
@@ -27,7 +29,7 @@ func TestClientErrorNamesTheSelectorsRefusal(t *testing.T) {
 			if w.Code != 503 || !strings.Contains(body, "claude-master: subscription alpha does not serve model claude-test-model (HTTP 404)") {
 				t.Fatalf("refusal not surfaced: %d %s", w.Code, body)
 			}
-			if strings.Contains(body, "later, vaguer") || strings.Contains(body, "private-upstream-error") || strings.Contains(body, "Configured inference failed") {
+			if strings.Contains(body, "later, vaguer") || strings.Contains(body, "no auth available") || strings.Contains(body, "private-upstream-error") || strings.Contains(body, "Configured inference failed") {
 				t.Fatalf("wrong text in the client error: %s", body)
 			}
 			plain := httptest.NewRecorder()
