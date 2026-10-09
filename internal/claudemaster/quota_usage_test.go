@@ -308,7 +308,9 @@ func TestFetchClaudeWeeklyQuotaFailures(t *testing.T) {
 
 func TestLoadBackendWeeklyQuotasOrdersRegisteredAccountsByReset(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
-	selector := &backendSeriesSelector{authIDs: []string{"later", "sooner"}, provider: "claude"}
+	// The fixture resets are fixed dates, so the selector gets a clock before them: with the real
+	// clock, once both dates were past, currentQuotaLocked rolled them forward and the order flipped.
+	selector := &backendSeriesSelector{authIDs: []string{"later", "sooner"}, provider: "claude", now: func() time.Time { return time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC) }}
 	t.Cleanup(selector.Stop)
 	for _, authID := range selector.authIDs {
 		_, err := manager.Register(t.Context(), &coreauth.Auth{

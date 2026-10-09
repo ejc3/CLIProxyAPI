@@ -250,9 +250,18 @@ provider-side state, including:
 
 - container or uploaded/file identifiers;
 - server-tool continuation state;
-- encrypted content or redacted thinking;
-- signed thinking or signed compaction blocks; or
+- encrypted server-tool content; or
+- signed compaction blocks; or
 - a payload that cannot be classified as valid JSON.
+
+Signed `thinking` and `redacted_thinking` blocks do NOT pin a conversation to its account.
+Anthropic's preserved-thinking rules say so and it was checked on this pool's own subscriptions on
+2026-10-09 with the `thinking-binding-controls-2026-08-01` beta: a Claude Opus 5.5 block minted on
+one subscription replays on another with `input_transformations: []`, even with
+`prefix_mismatch_behavior: "error"`; a Claude Sonnet 5.5 block is dropped by the API
+(`thinking_dropped`, reason `end_user_binding_mismatch`) and the request still succeeds. The proxy
+never strips thinking itself: the API already drops what the target model or account cannot read,
+and a client-side strip would be an edit that invalidates every later block.
 
 Bindings use Claude Code's conversation and agent hierarchy. A subagent can receive a
 separate account for self-contained work; if its first request carries opaque state, it
