@@ -502,7 +502,7 @@ backs that discipline up by masking secret-shaped keys and values.
 | info | `inference account switched` (conversation moved: `from`, `to`, `reason` = `reserve_reached`, `weekly_exhausted`, `rate_limited`, `rebalanced`, `subscriptions_exhausted`, `subscription_capacity_returned`) |
 | info | `profile rate limited` / `profile available again`; `quota band changed` (`ok` / `reserve` at 90% / `exhausted`) |
 | info | `login refreshed`, `login refresh adopted from another claude-master process`, `adopted a newer login after a 401` |
-| info | `quota` per profile and `routing summary` (requests per profile, switches, backup picks, refusals) every 5 minutes; `proxy summary` (connections, requests, active) every 5 minutes |
+| info | `quota` per profile (weekly, plus `five_hour_used_pct` and `five_hour_resets_in`) and `routing summary` (requests per profile, switches, backup picks, refusals) every 5 minutes; `proxy summary` (connections, requests, active) every 5 minutes |
 | info | `client connected for the first time` (certificate name, or `tunnel`), `proxy listening`, `inference backend started` |
 | warn | `using the paid API-key backup` (once a minute), `no inference account could be chosen`, `profile credential rejected by Anthropic` (401/403: the login may need redoing), `Anthropic server error`, `login refresh failed`, `subscription usage poll failed`, `client TLS handshake failed` (once a minute per remote address) |
 | debug | every routing decision (`account chosen`), `conversation bound`, every quota observation, each client tunnel |
@@ -538,6 +538,7 @@ from its credential file name (those carry the account's email address).
 | `claude_master.inference.errors` {profile, status, client_account} | counter | Anthropic errors by status |
 | `claude_master.inference.request_bytes`, `.response_bytes` {profile} | histogram | sizes |
 | `claude_master.quota.used_fraction`, `.resets_in_seconds`, `.rate_limited_for_seconds`, `.band` {profile} | gauge | each subscription's weekly allowance, when it resets, any cooldown, band (0 ok, 1 reserve, 2 exhausted, -1 unknown) |
+| `claude_master.quota.five_hour.used_fraction`, `.five_hour.resets_in_seconds` {profile} | gauge | each subscription's five-hour window from the usage poll (about once a minute, idle or not); 0 once the window has reset, and no countdown while no window is open |
 | `claude_master.anthropic.ratelimit` {profile, window, measure} | gauge | EVERY `Anthropic-Ratelimit-*` header: windows `5h`, `7d`, `api`; measures `utilization`, `resets_in_seconds`, `remaining`, `limit` ... |
 | `claude_master.anthropic.ratelimit.state` {profile, window, measure, value} | counter | status words: `allowed`, `allowed_warning`, `rejected` |
 | `claude_master.routing.picks` {profile}, `.switches` {from, to, reason}, `.backup_requests`, `.pick_duration` | counter / histogram | routing and failover |

@@ -265,8 +265,16 @@ func (s *backendSeriesSelector) logSnapshot(interval time.Duration) {
 		if s.quotaBlockedLocked(id) {
 			blocked = s.quotaBlockedUntil[id].Sub(s.nowOrReal()).Round(time.Second).String()
 		}
+		fiveHourPct, fiveHourResets := "unknown", "unknown"
+		if five, known := s.fiveHourNowLocked(id, s.nowOrReal()); known {
+			fiveHourPct, fiveHourResets = fmt.Sprintf("%.0f", five.UsedFraction*100), "no window"
+			if !five.ResetsAt.IsZero() {
+				fiveHourResets = five.ResetsAt.Sub(s.nowOrReal()).Round(time.Minute).String()
+			}
+		}
 		lg().Info("quota", "profile", s.profileNameLocked(id), "used_pct", usedPct(q), "band", quotaBand(q),
-			"resets_in", s.resetsIn(q), "rate_limited_for", blocked)
+			"resets_in", s.resetsIn(q), "rate_limited_for", blocked,
+			"five_hour_used_pct", fiveHourPct, "five_hour_resets_in", fiveHourResets)
 	}
 	stats := s.statsLocked()
 	names := make([]string, 0, len(stats.picks))
@@ -361,6 +369,12 @@ func (s *backendSeriesSelector) metricsSnapshot(stores []*backendStore) stateSna
 		}
 		if s.quotaBlockedLocked(id) {
 			p.BlockedSeconds = max(s.quotaBlockedUntil[id].Sub(now).Seconds(), 0)
+		}
+		if five, known := s.fiveHourNowLocked(id, now); known {
+			p.FiveHourKnown, p.FiveHourUsed = true, five.UsedFraction
+			if !five.ResetsAt.IsZero() {
+				p.FiveHourResetsKnown, p.FiveHourResetsIn = true, max(five.ResetsAt.Sub(now).Seconds(), 0)
+			}
 		}
 		if v, ok := expiry[id]; ok {
 			p.TokenKnown, p.TokenExpiresIn = true, v

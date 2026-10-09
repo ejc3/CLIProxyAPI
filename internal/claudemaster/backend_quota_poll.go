@@ -61,6 +61,32 @@ func startBackendQuotaPolling(ctx context.Context, manager *coreauth.Manager, se
 	return done
 }
 
+// observeFiveHourQuota records an account's polled five-hour window for the gauges and the log.
+func (s *backendSeriesSelector) observeFiveHourQuota(authID string, quota ClaudeFiveHourQuota) {
+	if strings.TrimSpace(authID) == "" || authID == s.backupAuthID {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return
+	}
+	if s.fiveHour == nil {
+		s.fiveHour = make(map[string]ClaudeFiveHourQuota, len(s.authIDs))
+	}
+	s.fiveHour[authID] = quota
+}
+
+// fiveHourNowLocked is an account's five-hour window as of now: once its reset has passed the
+// window is over and nothing of it is used, whatever the last poll said.
+func (s *backendSeriesSelector) fiveHourNowLocked(authID string, now time.Time) (quota ClaudeFiveHourQuota, known bool) {
+	quota, known = s.fiveHour[authID]
+	if known && !quota.ResetsAt.IsZero() && !now.Before(quota.ResetsAt) {
+		quota = ClaudeFiveHourQuota{}
+	}
+	return quota, known
+}
+
 func (s *backendSeriesSelector) quotaPollRevision(authID string) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
