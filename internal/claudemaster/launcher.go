@@ -119,17 +119,7 @@ func LaunchProfilesWithOptions(ctx context.Context, profiles []Profile, args []s
 		return 1, err
 	}
 	defer func() { _ = os.RemoveAll(certs.dir) }()
-	var backend *Backend
-	if len(profiles) == 1 && opts.BackupAPIKey == "" {
-		profile := profiles[0]
-		backend, err = NewBackend(ctx, BackendOptions{AuthDir: profile.AuthDir, Provider: profile.Provider, AuthID: profile.AuthID, UseRequestModel: true, ModelMap: opts.ModelMap})
-	} else {
-		credentials := make([]BackendCredential, 0, len(profiles))
-		for _, profile := range profiles {
-			credentials = append(credentials, BackendCredential{AuthDir: profile.AuthDir, Provider: profile.Provider, AuthID: profile.AuthID})
-		}
-		backend, err = NewBackendSeries(ctx, BackendSeriesOptions{Credentials: credentials, BackupAPIKey: opts.BackupAPIKey, ModelMap: opts.ModelMap})
-	}
+	backend, err := newInferenceBackend(ctx, profiles, opts)
 	if err != nil {
 		return 1, errors.New("cannot start selected inference backend; check the profile")
 	}
@@ -142,7 +132,14 @@ func LaunchProfilesWithOptions(ctx context.Context, profiles []Profile, args []s
 			backend.Handler().ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
-	proxy, err := StartProxy(ProxyOptions{GetCertificate: certs.getCertificate, Inference: inference})
+	clientCert, clientKey, err := certs.writeClientCertificate()
+	if err != nil {
+		return 1, err
+	}
+	proxy, err := StartProxy(ProxyOptions{
+		GetCertificate: certs.getCertificate, Inference: inference,
+		ProxyCertificate: certs.proxyServerCertificate, ClientCAs: certs.clientPool(),
+	})
 	if err != nil {
 		return 1, errors.New("cannot start private inference proxy")
 	}
@@ -156,10 +153,28 @@ func LaunchProfilesWithOptions(ctx context.Context, profiles []Profile, args []s
 			}{observation.result()})
 		}
 	}()
-	env, err := ChildEnvironment(environ, args, proxy.URL(), certs.caPath)
+	env, err := ChildEnvironment(environ, args, proxy.URL(), certs.caPath, clientCert, clientKey)
 	if err != nil {
 		return 1, err
 	}
+	return runNativeChild(ctx, bin, args, env)
+}
+
+// newInferenceBackend opens the profiles as one backend: a single profile, or a quota-aware series.
+func newInferenceBackend(ctx context.Context, profiles []Profile, opts LaunchOptions) (*Backend, error) {
+	if len(profiles) == 1 && opts.BackupAPIKey == "" {
+		profile := profiles[0]
+		return NewBackend(ctx, BackendOptions{AuthDir: profile.AuthDir, Provider: profile.Provider, AuthID: profile.AuthID, UseRequestModel: true, ModelMap: opts.ModelMap})
+	}
+	credentials := make([]BackendCredential, 0, len(profiles))
+	for _, profile := range profiles {
+		credentials = append(credentials, BackendCredential{AuthDir: profile.AuthDir, Provider: profile.Provider, AuthID: profile.AuthID})
+	}
+	return NewBackendSeries(ctx, BackendSeriesOptions{Credentials: credentials, BackupAPIKey: opts.BackupAPIKey, ModelMap: opts.ModelMap})
+}
+
+// runNativeChild runs the native Claude with its prepared environment and returns its exit code.
+func runNativeChild(ctx context.Context, bin string, args, env []string) (int, error) {
 	child := exec.CommandContext(ctx, bin, args...)
 	child.Cancel = func() error { return child.Process.Signal(syscall.SIGTERM) }
 	// This bounds process shutdown only; inference streams have no post-connect wall-clock timeout.
@@ -191,7 +206,7 @@ func Preflight(ctx context.Context, args []string) (string, error) {
 }
 
 func preflight(ctx context.Context, args, environ []string) (string, error) {
-	if _, err := ChildEnvironment(environ, args, "http://127.0.0.1:1", "/unused"); err != nil {
+	if _, err := ChildEnvironment(environ, args, "https://127.0.0.1:1", "/unused", "", ""); err != nil {
 		return "", err
 	}
 	if err := validateNativeSettings(ctx, environ); err != nil {
@@ -203,11 +218,12 @@ func preflight(ctx context.Context, args, environ []string) (string, error) {
 // ChildEnvironment preserves the master login while denying configuration that bypasses the
 // process proxy or switches Claude to an API/third-party mode that disables native Remote Control.
 // The proxy URL contains a private capability and must never be printed or placed in argv.
-func ChildEnvironment(environ, args []string, proxyURL, caPath string) ([]string, error) {
+func ChildEnvironment(environ, args []string, proxyURL, caPath, clientCert, clientKey string) ([]string, error) {
 	removed := map[string]bool{
 		"HTTPS_PROXY": true, "https_proxy": true, "HTTP_PROXY": true, "http_proxy": true,
 		"ALL_PROXY": true, "all_proxy": true, "NO_PROXY": true, "no_proxy": true,
 		"NODE_EXTRA_CA_CERTS": true, "CLAUDE_CODE_CHILD_SESSION": true,
+		"CLAUDE_CODE_CLIENT_CERT": true, "CLAUDE_CODE_CLIENT_KEY": true, "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE": true,
 		"CLAUDE_CODE_SESSION_ID": true, "REMOTE_CLAW_SECRET_FILE": true,
 		"VERCEL_AUTOMATION_BYPASS_SECRET": true,
 		"DISABLE_AUTOUPDATER":             true,
@@ -238,5 +254,9 @@ func ChildEnvironment(environ, args []string, proxyURL, caPath string) ([]string
 		out = append(out, entry)
 	}
 	out = append(out, "HTTPS_PROXY="+proxyURL, "https_proxy="+proxyURL, "NODE_EXTRA_CA_CERTS="+caPath, "DISABLE_AUTOUPDATER=1")
+	if clientCert != "" && clientKey != "" {
+		// Claude offers this certificate to its HTTPS proxy, which is how the proxy knows its caller.
+		out = append(out, "CLAUDE_CODE_CLIENT_CERT="+clientCert, "CLAUDE_CODE_CLIENT_KEY="+clientKey)
+	}
 	return out, nil
 }

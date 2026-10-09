@@ -67,7 +67,7 @@ func TestLaunchEnvironmentConsumesOnlyBackupKeySources(t *testing.T) {
 			if len(got) != 2 || got["PATH"] != "/usr/bin" || got["USER"] != "alice" {
 				t.Fatal("backup sources were inherited or unrelated environment was removed")
 			}
-			child, err := ChildEnvironment(filtered, nil, "proxy", "ca")
+			child, err := ChildEnvironment(filtered, nil, "proxy", "ca", "", "")
 			if err != nil {
 				t.Fatal("consumed key still triggered native provider-mode rejection")
 			}
@@ -83,7 +83,7 @@ func TestLaunchEnvironmentConsumesOnlyBackupKeySources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ChildEnvironment(filtered, nil, "proxy", "ca"); err == nil {
+	if _, err := ChildEnvironment(filtered, nil, "proxy", "ca", "", ""); err == nil {
 		t.Fatal("an unselected native API key bypassed normal master-login validation")
 	}
 }
@@ -127,8 +127,8 @@ func TestPreflightConsumesBackupKeyBeforeSettingsDiscovery(t *testing.T) {
 }
 
 func TestChildEnvironmentPreservesMasterAndScopesProxy(t *testing.T) {
-	const proxyURL = "http://private-capability@127.0.0.1:1234"
-	env, err := ChildEnvironment([]string{"PATH=/usr/bin", "USER=alice", "HTTPS_PROXY=http://old", "NO_PROXY=*", "no_proxy=api.anthropic.com", "CLAUDE_CODE_CHILD_SESSION=parent", "CLAUDE_CODE_SESSION_ID=old", "REMOTE_CLAW_SECRET_FILE=private", "CLAUDE_MASTER_TEST_SECRET=secret"}, []string{"--remote-control"}, proxyURL, "/process/ca.pem")
+	const proxyURL = "https://127.0.0.1:1234"
+	env, err := ChildEnvironment([]string{"PATH=/usr/bin", "USER=alice", "HTTPS_PROXY=http://old", "NO_PROXY=*", "no_proxy=api.anthropic.com", "CLAUDE_CODE_CHILD_SESSION=parent", "CLAUDE_CODE_SESSION_ID=old", "REMOTE_CLAW_SECRET_FILE=private", "CLAUDE_MASTER_TEST_SECRET=secret", "CLAUDE_CODE_CLIENT_CERT=/home/user/own.pem", "CLAUDE_CODE_CLIENT_KEY=/home/user/own.key", "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE=hunter2"}, []string{"--remote-control"}, proxyURL, "/process/ca.pem", "/process/client.pem", "/process/client.key")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,6 +138,14 @@ func TestChildEnvironmentPreservesMasterAndScopesProxy(t *testing.T) {
 			t.Errorf("leaked %s", key)
 		}
 	}
+	// The proxy is told who is calling by a client certificate: the launch's own, never one the
+	// caller had configured, and never a passphrase.
+	if got["CLAUDE_CODE_CLIENT_CERT"] != "/process/client.pem" || got["CLAUDE_CODE_CLIENT_KEY"] != "/process/client.key" {
+		t.Fatal("the child was not given this launch's client certificate")
+	}
+	if _, ok := got["CLAUDE_CODE_CLIENT_KEY_PASSPHRASE"]; ok {
+		t.Fatal("an inherited client-key passphrase reached the child")
+	}
 	if got["PATH"] != "/usr/bin" || got["USER"] != "alice" || got["HTTPS_PROXY"] != proxyURL || got["https_proxy"] != proxyURL || got["NODE_EXTRA_CA_CERTS"] != "/process/ca.pem" || got["DISABLE_AUTOUPDATER"] != "1" {
 		t.Fatal("incorrect child environment")
 	}
@@ -145,7 +153,7 @@ func TestChildEnvironmentPreservesMasterAndScopesProxy(t *testing.T) {
 
 func TestChildEnvironmentDisablesOnlyItsOwnUpdater(t *testing.T) {
 	parent := []string{"DISABLE_AUTOUPDATER=0", "DISABLE_AUTOUPDATER=false"}
-	env, err := ChildEnvironment(parent, nil, "proxy", "ca")
+	env, err := ChildEnvironment(parent, nil, "proxy", "ca", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +174,7 @@ func TestChildEnvironmentDisablesOnlyItsOwnUpdater(t *testing.T) {
 func TestChildEnvironmentRejectsBypassConfiguration(t *testing.T) {
 	for _, key := range []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CONFIG_DIR", "NODE_OPTIONS", "NODE_TLS_REJECT_UNAUTHORIZED"} {
 		t.Run(key, func(t *testing.T) {
-			_, err := ChildEnvironment([]string{key + "=sensitive-canary"}, nil, "proxy", "ca")
+			_, err := ChildEnvironment([]string{key + "=sensitive-canary"}, nil, "proxy", "ca", "", "")
 			if err == nil {
 				t.Fatal("accepted bypass")
 			}
@@ -176,7 +184,7 @@ func TestChildEnvironmentRejectsBypassConfiguration(t *testing.T) {
 		})
 	}
 	for _, arg := range []string{"--settings=canary", "--setting-sources", "--sdk-url=wss://bad", "--api-key=canary", "--base-url=https://bad"} {
-		if _, err := ChildEnvironment(nil, []string{arg}, "proxy", "ca"); err == nil {
+		if _, err := ChildEnvironment(nil, []string{arg}, "proxy", "ca", "", ""); err == nil {
 			t.Errorf("accepted flag %s", arg)
 		}
 	}
