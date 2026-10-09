@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -38,6 +39,10 @@ type ProxyOptions struct {
 	ClientCAs        *x509.CertPool
 	// Listen is the address to bind; the default is an ephemeral IPv4 loopback port.
 	Listen string
+	// OpenListen, when set, adds a SECOND listener that is plain HTTP and asks for no certificate.
+	// It must be a loopback address: whatever can reach it is trusted, so an authenticating tunnel
+	// (cloudflared, an SSH forward) is expected to be the only thing that does.
+	OpenListen string
 }
 
 // ProxyStats is a best-effort, counter-only diagnostic snapshot. It never
@@ -67,6 +72,7 @@ type proxyCounters struct {
 // Only api.anthropic.com is TLS-terminated; other HTTPS hosts are blind tunnels.
 type Proxy struct {
 	url         string
+	openAddr    string
 	ctx         context.Context
 	cancel      context.CancelFunc
 	outer       *http.Server
@@ -97,9 +103,22 @@ func StartProxy(opts ProxyOptions) (*Proxy, error) {
 	if opts.Listen != "" {
 		network, address = "tcp", opts.Listen
 	}
+	var openListener net.Listener
+	if opts.OpenListen != "" {
+		if _, _, err := loopbackEndpoint(opts.OpenListen); err != nil {
+			return nil, fmt.Errorf("the open listener: %w", err)
+		}
+	}
 	rawListener, err := net.Listen(network, address)
 	if err != nil {
 		return nil, errors.New("cannot bind the proxy")
+	}
+	if opts.OpenListen != "" {
+		openListener, err = net.Listen("tcp", opts.OpenListen)
+		if err != nil {
+			_ = rawListener.Close()
+			return nil, errors.New("cannot bind the open loopback listener")
+		}
 	}
 	listener := tls.NewListener(rawListener, &tls.Config{
 		GetCertificate: opts.ProxyCertificate, ClientCAs: opts.ClientCAs, ClientAuth: tls.RequireAndVerifyClientCert,
@@ -144,12 +163,20 @@ func StartProxy(opts ProxyOptions) (*Proxy, error) {
 	p.inner = &http.Server{Handler: p.ownedHandler(p.handleAPI), BaseContext: baseContext, ErrorLog: log.New(io.Discard, "", 0)}
 	p.wg.Add(2)
 	go func() { defer p.wg.Done(); _ = p.outer.Serve(listener) }()
+	if openListener != nil {
+		p.openAddr = openListener.Addr().String()
+		p.wg.Add(1)
+		go func() { defer p.wg.Done(); _ = p.outer.Serve(openListener) }()
+	}
 	go func() { defer p.wg.Done(); _ = p.inner.Serve(p.innerListen) }()
 	return p, nil
 }
 
 // URL is the proxy's https address. It carries no credential: clients authenticate with a certificate.
 func (p *Proxy) URL() string { return p.url }
+
+// OpenAddr is the plain loopback listener's address, or "" when there is none.
+func (p *Proxy) OpenAddr() string { return p.openAddr }
 
 // Addr is the address the proxy listens on.
 func (p *Proxy) Addr() string { return strings.TrimPrefix(p.url, "https://") }
@@ -225,7 +252,19 @@ func (p *Proxy) track(conn net.Conn) *proxyConn {
 	return tracked
 }
 
+// proxyProbePath is the one request a proxy answers for itself. A client uses it to tell a claude-master
+// proxy from some other service at the same address; it reveals nothing and changes nothing.
+const (
+	proxyProbePath   = "/.claude-master/probe"
+	proxyProbeHeader = "X-Claude-Master"
+)
+
 func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && r.URL.Path == proxyProbePath {
+		w.Header().Set(proxyProbeHeader, "1")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if r.Method != http.MethodConnect {
 		p.counters.connectRejected.Add(1)
 		http.Error(w, "proxy expects HTTPS CONNECT", http.StatusBadRequest)
