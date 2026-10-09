@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -48,17 +47,13 @@ type localForwarder struct {
 // port can also tunnel through it, which grants nothing it could not do directly; only the token
 // reaches the claude-master proxy.
 func startLocalForwarder(upstream upstreamDialer) (*localForwarder, error) {
-	secret := make([]byte, 32)
-	if _, err := rand.Read(secret); err != nil {
-		return nil, errors.New("cannot create the forwarder token")
-	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		return nil, errors.New("cannot bind the local forwarder")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &localForwarder{
-		listener: listener, token: hex.EncodeToString(secret), upstream: upstream,
+		listener: listener, token: rand.Text(), upstream: upstream,
 		dial: (&net.Dialer{}).DialContext, ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{}),
 	}
 	f.server = &http.Server{
@@ -129,11 +124,13 @@ func (f *localForwarder) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	host, port, err := net.SplitHostPort(r.RequestURI)
-	if n, errPort := strconv.Atoi(port); err != nil || host == "" || errPort != nil || n < 1 || n > 65535 {
+	n, errPort := strconv.ParseUint(port, 10, 16)
+	if err != nil || host == "" || errPort != nil || n == 0 {
 		http.Error(w, "invalid CONNECT authority", http.StatusBadRequest)
 		return
 	}
-	toMaster := port == "443" && strings.TrimRight(strings.ToLower(host), ".") == masterAPIHost && f.authorized(r)
+	// The port is compared as a number, so 0443 is 443 too; anything else on api.anthropic.com goes direct.
+	toMaster := n == 443 && strings.TrimSuffix(strings.ToLower(host), ".") == masterAPIHost && f.authorized(r)
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "CONNECT unavailable", http.StatusInternalServerError)
@@ -154,7 +151,7 @@ func (f *localForwarder) handle(w http.ResponseWriter, r *http.Request) {
 	defer f.untrack(raw)
 	remote, tracked, err := f.open(toMaster, net.JoinHostPort(host, port))
 	if err != nil {
-		lg().Debug("forwarder tunnel failed", "to_master", toMaster)
+		lg().Debug("forwarder tunnel failed", "to_master", toMaster, "error", err)
 		_, _ = buffered.WriteString("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
 		_ = buffered.Flush()
 		return
@@ -170,13 +167,15 @@ func (f *localForwarder) handle(w http.ResponseWriter, r *http.Request) {
 	relay(&proxyBufferedConn{Conn: raw, reader: buffered.Reader}, remote)
 }
 
-// authorized checks the token in Proxy-Authorization (Basic, password only).
+// authorized checks the token in the first Proxy-Authorization: "Basic " (any case, one space) and
+// base64 of user:token, as net/http reads Basic credentials; only the password is compared.
 func (f *localForwarder) authorized(r *http.Request) bool {
-	scheme, encoded, ok := strings.Cut(r.Header.Get("Proxy-Authorization"), " ")
-	if !ok || !strings.EqualFold(scheme, "Basic") {
+	const prefix = "Basic "
+	value := r.Header.Get("Proxy-Authorization")
+	if len(value) < len(prefix) || !strings.EqualFold(value[:len(prefix)], prefix) {
 		return false
 	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(encoded))
+	decoded, err := base64.StdEncoding.DecodeString(value[len(prefix):])
 	if err != nil {
 		return false
 	}
@@ -231,17 +230,34 @@ func connectMaster(conn net.Conn) (net.Conn, error) {
 	return &proxyBufferedConn{Conn: conn, reader: reader}, nil
 }
 
-// relay copies both ways until either side ends, then closes both.
+// relay copies both ways. When one side finishes sending, the other is told with a half-close, so
+// a client that half-closes still receives the rest of the reply; both close once both directions
+// are done, or at once if either fails or a side cannot half-close.
 func relay(a, b net.Conn) {
 	finished := make(chan struct{})
 	go func() {
-		_, _ = io.Copy(b, a)
+		defer close(finished)
+		if _, err := io.Copy(b, a); err != nil || !closeWrite(b) {
+			_ = a.Close()
+			_ = b.Close()
+		}
+	}()
+	if _, err := io.Copy(a, b); err != nil || !closeWrite(a) {
 		_ = a.Close()
 		_ = b.Close()
-		close(finished)
-	}()
-	_, _ = io.Copy(a, b)
+	}
+	<-finished
 	_ = a.Close()
 	_ = b.Close()
-	<-finished
+}
+
+// closeWrite half-closes conn (a TCP FIN, or TLS close_notify) and reports whether it could.
+func closeWrite(conn net.Conn) bool {
+	if buffered, ok := conn.(*proxyBufferedConn); ok {
+		conn = buffered.Conn
+	}
+	if half, ok := conn.(interface{ CloseWrite() error }); ok {
+		return half.CloseWrite() == nil
+	}
+	return false
 }
