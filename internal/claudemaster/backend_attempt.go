@@ -19,8 +19,9 @@ type backendAttemptKey struct{}
 type backendAttempt struct {
 	mu               sync.Mutex
 	failures         map[string]map[string]int // model key -> auth id -> upstream HTTP status (0 when none)
-	refusal          string                    // the selector's refusal in this request, for the client's error
+	refusal          error                     // the selector's refusal in this request, for the client's error
 	refusalGeneric   bool                      // the refusal is a bare core error; a specific one replaces it
+	upstream         *backendUpstreamError     // the latest upstream error response of this request, exactly
 	route            *backendRouteAttempt
 	pickedAt         time.Time // when an account was chosen: claude-master's own time ends here
 	count            bool
@@ -227,44 +228,40 @@ func noteBackendRefusal(ctx context.Context, err error) {
 	generic := backendGenericRefusal(err)
 	state.mu.Lock()
 	switch {
-	case state.refusal == "":
-		state.refusal, state.refusalGeneric = err.Error(), generic
+	case state.refusal == nil:
+		state.refusal, state.refusalGeneric = err, generic
 	case state.refusalGeneric && !generic:
-		state.refusal, state.refusalGeneric = err.Error(), false
+		state.refusal, state.refusalGeneric = err, false
 	}
 	state.mu.Unlock()
+}
+
+func backendRefusalErrorFrom(ctx context.Context) error {
+	state := backendRequestAttempt(ctx)
+	if state == nil {
+		return nil
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.refusal
 }
 
 // backendGenericRefusal reports a core auth error (auth_unavailable, auth_not_found, a model
 // cooldown) as opposed to a reason the selector wrote itself.
 func backendGenericRefusal(err error) bool {
-	var explained *backendExplainedRefusal
-	if errors.As(err, &explained) {
+	var refusal *backendRefusalError
+	if errors.As(err, &refusal) {
 		return false
 	}
 	var authErr *coreauth.Error
 	return errors.As(err, &authErr)
 }
 
-// backendExplainedRefusal is a core error with the selector's reason in front of it: the reason
-// is what the session reads, the wrapped core error is what the scheduler keeps deciding by
-// (cooldowns, retries), so explaining a refusal changes nothing about routing.
-type backendExplainedRefusal struct {
-	reason string
-	cause  error
-}
-
-func (e *backendExplainedRefusal) Error() string { return e.reason }
-func (e *backendExplainedRefusal) Unwrap() error { return e.cause }
-
 func backendRefusal(ctx context.Context) string {
-	state := backendRequestAttempt(ctx)
-	if state == nil {
-		return ""
+	if err := backendRefusalErrorFrom(ctx); err != nil {
+		return err.Error()
 	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	return state.refusal
+	return ""
 }
 
 func backendAttemptFailed(ctx context.Context, authID, model string) bool {

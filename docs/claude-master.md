@@ -272,12 +272,21 @@ can still start normally, and already-bound children retain their own origins.
 This lets independent fanout use separate subscriptions without guessing the
 owner of account-bound continuation data.
 
-When the selector refuses a request, the session sees the reason in claude-master's own
-words (`claude-master: subscription NAME does not serve model M (HTTP 404); ... Switch model
-with /model`) instead of the generic "Configured inference failed". The text is
-claude-master's: a profile name, a model, an HTTP status; never upstream text. Only a
-used-up weekly quota moves a conversation; an upstream error on the bound subscription
-(a model it does not serve, a 5xx) keeps it there, and the message says so.
+Errors reach the session exactly as Anthropic sends them, so the client reacts as it would
+to Anthropic. An upstream error response is relayed byte for byte (its status, its body, and
+the headers the client acts on: `request-id`, `retry-after`, `x-should-retry`,
+`anthropic-ratelimit-*`), including when the scheduler retried after it and the pool then
+refused: the last upstream error of the request is what the session gets. Only a refusal with
+no upstream error behind it is synthesized, in Anthropic's error shape, with the type and
+status the client would get from Anthropic for that situation: every subscription out of
+weekly quota is a 429 `rate_limit_error` with Anthropic's rate-limit text, the unified
+rate-limit headers and a `retry-after` pointing at the earliest reset; opaque state the pool
+will not move is a 400 `invalid_request_error`; a bound subscription that does not serve the
+model is a 404 `not_found_error`; a cooldown or an active handoff is a 529
+`overloaded_error`; the pool's own fault is a 500 `api_error`. The reason is in the message
+(`claude-master: ...`) or, for the 429, in the `Claude-Master-Reason` header; it is
+claude-master's text (a profile name, a model, a status), never upstream text. Only a used-up
+weekly quota moves a conversation; an upstream error on the bound subscription keeps it there.
 
 An account handoff is deferred while another generation for the same session is
 active. Clients must preserve chronological history under a session ID; replaying

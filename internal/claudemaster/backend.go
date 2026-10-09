@@ -227,7 +227,7 @@ func newBackend(ctx context.Context, credentials []BackendCredential, modelName 
 	switch provider {
 	case "claude":
 		executor := newSharedClaudeExecutor(runtimeexecutor.NewClaudeExecutor(cfg), stores)
-		manager.RegisterExecutor(executor)
+		manager.RegisterExecutor(withBackendUpstreamRecording(executor))
 		if quotaRequest == nil {
 			quotaRequest = manager.HttpRequest // the default requester, resolved here so the cache wraps it
 		}
@@ -720,7 +720,7 @@ func (s *backendSeriesSelector) Pick(ctx context.Context, provider, model string
 
 func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string, opts coreexecutor.Options, auths []*coreauth.Auth) (*coreauth.Auth, error) {
 	if provider != s.provider && provider != "mixed" {
-		return nil, errors.New("inference provider differs from the ordered profiles")
+		return nil, backendRefuse(backendRefusalInternal, "inference provider differs from the ordered profiles")
 	}
 	sessionID, parentSessionID := backendSeriesSessionIDs(opts)
 	affinity := analyzeNativeRequestAffinity(opts.OriginalRequest)
@@ -733,7 +733,7 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stopped {
-		return nil, errors.New("ordered inference selector is stopped")
+		return nil, backendRefuse(backendRefusalUnavailable, "ordered inference selector is stopped")
 	}
 	s.initializeLocked()
 	// A paid API credential is not subscription capacity: do not use it to
@@ -760,7 +760,7 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 					return nil, errEpoch
 				}
 				if changed {
-					return nil, errors.New("the parent Claude conversation changed accounts; the first opaque child origin is ambiguous, so start the child with self-contained context")
+					return nil, backendRefuse(backendRefusalInvalid, "the parent Claude conversation changed accounts; the first opaque child origin is ambiguous, so start the child with self-contained context")
 				}
 			}
 		}
@@ -772,7 +772,7 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 				// Opaque API continuations still take the ordinary bound path below.
 				selected := s.preferredAuthLocked(auths, "")
 				if selected == nil {
-					return nil, errors.New("subscription capacity is unavailable; no quota handoff to the API-key backup is permitted")
+					return nil, s.quotaRefusalLocked("subscription capacity is unavailable; no quota handoff to the API-key backup is permitted")
 				}
 				picked, err := s.pickAuthLocked(ctx, model, opts, selected)
 				if err == nil && picked != nil {
@@ -793,7 +793,9 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 					// The core refused the bound subscription (a model cooldown, an attempt that failed in
 					// this request): say which subscription, which model and why, in front of its error.
 					if err != nil && backendGenericRefusal(err) {
-						err = &backendExplainedRefusal{reason: s.boundUnavailableErrorLocked(ctx, boundID, backendAvailabilityModel(model, opts)).Error(), cause: err}
+						explained := s.boundUnavailableErrorLocked(ctx, boundID, backendAvailabilityModel(model, opts)).(*backendRefusalError)
+						explained.cause = err
+						err = explained
 					}
 					return picked, err
 				}
@@ -812,7 +814,7 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 				return s.bindSessionLocked(ctx, sessionID, picked)
 			} else {
 				if !switchable {
-					return nil, errors.New("the current Claude continuation account is unavailable; refusing to move opaque conversation state")
+					return nil, backendRefuse(backendRefusalInvalid, "the current Claude continuation account is unavailable; refusing to move opaque conversation state")
 				}
 				// Manager-side model cooldowns and request-scoped failures also
 				// remove an auth from this candidate slice. They must not rotate a
@@ -826,12 +828,12 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 		}
 	}
 	if opaque && excludedAuthID == "" {
-		return nil, errors.New("the Claude continuation origin is unknown; start a self-contained session before switching subscriptions")
+		return nil, backendRefuse(backendRefusalInvalid, "the Claude continuation origin is unknown; start a self-contained session before switching subscriptions")
 	}
 
 	selected := s.preferredAuthLocked(auths, excludedAuthID)
 	if selected == nil {
-		return nil, errors.New("ordered inference subscriptions are exhausted; no fallback is configured")
+		return nil, s.quotaRefusalLocked("ordered inference subscriptions are exhausted; no fallback is configured")
 	}
 	picked, err := s.pickAuthLocked(ctx, model, opts, selected)
 	if err != nil {
@@ -852,16 +854,21 @@ func (s *backendSeriesSelector) boundUnavailableErrorLocked(ctx context.Context,
 	if n := s.names[boundID]; n != "" {
 		name = n
 	}
+	refusal := &backendRefusalError{kind: backendRefusalUnavailable, authID: boundID, model: model}
 	if status, failed := backendAttemptStatus(ctx, boundID, model); failed {
-		if status == http.StatusNotFound {
-			return fmt.Errorf("subscription %s does not serve model %s (HTTP 404); the pool moves a conversation only for a used-up weekly quota, not for a model it cannot serve. Switch model with /model", name, model)
+		switch {
+		case status == http.StatusNotFound:
+			refusal.kind = backendRefusalNotFound
+			refusal.reason = fmt.Sprintf("subscription %s does not serve model %s (HTTP 404); the pool moves a conversation only for a used-up weekly quota, not for a model it cannot serve. Switch model with /model", name, model)
+		case status != 0:
+			refusal.reason = fmt.Sprintf("subscription %s answered HTTP %d for model %s; the pool moves a conversation only for a used-up weekly quota, not for an upstream error. Retry, or switch model with /model", name, status, model)
+		default:
+			refusal.reason = fmt.Sprintf("subscription %s failed this request for model %s; the pool moves a conversation only for a used-up weekly quota, not for an upstream error. Retry, or switch model with /model", name, model)
 		}
-		if status != 0 {
-			return fmt.Errorf("subscription %s answered HTTP %d for model %s; the pool moves a conversation only for a used-up weekly quota, not for an upstream error. Retry, or switch model with /model", name, status, model)
-		}
-		return fmt.Errorf("subscription %s failed this request for model %s; the pool moves a conversation only for a used-up weekly quota, not for an upstream error. Retry, or switch model with /model", name, model)
+		return refusal
 	}
-	return fmt.Errorf("subscription %s is not available for model %s right now (cooling down after an upstream error, not out of weekly quota), so this conversation stays with it. Retry shortly, or switch model with /model", name, model)
+	refusal.reason = fmt.Sprintf("subscription %s is not available for model %s right now (cooling down after an upstream error, not out of weekly quota), so this conversation stays with it. Retry shortly, or switch model with /model", name, model)
+	return refusal
 }
 
 func backendSeriesSessionIDs(opts coreexecutor.Options) (sessionID, parentSessionID string) {
@@ -896,7 +903,7 @@ func (s *backendSeriesSelector) subscriptionsExhaustedLocked() bool {
 func (s *backendSeriesSelector) pickBackupLocked(ctx context.Context, model string, opts coreexecutor.Options, auths []*coreauth.Auth, sessionID string) (*coreauth.Auth, error) {
 	backup := backendSeriesAuthByID(auths, s.provider, s.backupAuthID)
 	if backup == nil {
-		return nil, errors.New("the final API-key backup is unavailable")
+		return nil, backendRefuse(backendRefusalUnavailable, "the final API-key backup is unavailable")
 	}
 	if s.limiter == nil {
 		s.limiter = newEvery(time.Minute)
@@ -951,7 +958,7 @@ func (s *backendSeriesSelector) pickAuthLocked(ctx context.Context, model string
 	if auth != nil && auth.ID != s.backupAuthID {
 		quota := s.currentQuotaLocked(auth.ID)
 		if s.quotaBlockedLocked(auth.ID) || (quota.known && quota.used >= 1) {
-			return nil, errors.New("the current Claude subscription quota is exhausted")
+			return nil, s.quotaRefusalLocked("the current Claude subscription quota is exhausted")
 		}
 	}
 	return (&coreauth.FillFirstSelector{}).Pick(ctx, s.provider, backendAvailabilityModel(model, opts), opts, []*coreauth.Auth{auth})
@@ -1831,7 +1838,7 @@ func writeBackendUpstreamError(ctx context.Context, w http.ResponseWriter, errMs
 		return
 	}
 	if errMsg == nil {
-		backendError(w, http.StatusBadGateway, backendFailureMessage(ctx))
+		writeBackendFailure(ctx, w, http.StatusBadGateway, writeBackendProtocolHeaders)
 		return
 	}
 	writeBackendProtocolHeaders(w.Header(), errMsg.Addon)
@@ -1839,17 +1846,7 @@ func writeBackendUpstreamError(ctx context.Context, w http.ResponseWriter, errMs
 	if status < 400 || status > 599 {
 		status = http.StatusBadGateway
 	}
-	backendError(w, status, backendFailureMessage(ctx))
-}
-
-// backendFailureMessage is the client's error text when no upstream body is passed through: the
-// selector's own refusal when it made one (its text is claude-master's, never upstream text),
-// else the generic line.
-func backendFailureMessage(ctx context.Context) string {
-	if reason := backendRefusal(ctx); reason != "" {
-		return "claude-master: " + reason
-	}
-	return "Configured inference failed; no fallback to the native master was attempted"
+	writeBackendFailure(ctx, w, status, writeBackendProtocolHeaders)
 }
 
 func writeBackendNativeUpstreamError(ctx context.Context, w http.ResponseWriter, errMsg *interfaces.ErrorMessage) {
@@ -1860,7 +1857,7 @@ func writeBackendNativeUpstreamError(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 	if errMsg == nil {
-		backendError(w, http.StatusBadGateway, backendFailureMessage(ctx))
+		writeBackendFailure(ctx, w, http.StatusBadGateway, writeBackendNativeHeaders)
 		return
 	}
 	writeBackendNativeHeaders(w.Header(), errMsg.Addon)
@@ -1868,7 +1865,7 @@ func writeBackendNativeUpstreamError(ctx context.Context, w http.ResponseWriter,
 	if status < 400 || status > 599 {
 		status = http.StatusBadGateway
 	}
-	backendError(w, status, backendFailureMessage(ctx))
+	writeBackendFailure(ctx, w, status, writeBackendNativeHeaders)
 }
 
 func backendDirectErrorResponse(errMsg *interfaces.ErrorMessage) (int, http.Header, []byte, bool) {
