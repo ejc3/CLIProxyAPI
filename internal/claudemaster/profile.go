@@ -164,7 +164,7 @@ func (l *ProfileLock) Login(ctx context.Context, provider string, prompt func(st
 	// Use the normal interactive Anthropic OAuth flow. The authenticator opens
 	// the browser when one is available and otherwise prints the same URL plus
 	// callback/tunnel instructions for a remote host.
-	options := &sdkauth.LoginOptions{Prompt: prompt}
+	options := &sdkauth.LoginOptions{Prompt: prompt, ManualCode: provider == "claude"}
 	if provider == "codex" {
 		options.Metadata = map[string]string{"codex_login_mode": "device"}
 	}
