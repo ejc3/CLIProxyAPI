@@ -52,7 +52,7 @@ func Serve(ctx context.Context, profiles []Profile, opts ServeOptions) error {
 	if launch.SnapshotInterval == 0 {
 		launch.SnapshotInterval = opts.SnapshotInterval
 	}
-	backend, err := newInferenceBackend(ctx, profiles, launch)
+	backend, err := newInferenceBackend(serveBackendLifetime(ctx), profiles, launch)
 	if err != nil {
 		return errors.New("cannot start the inference backend; check the profiles")
 	}
@@ -81,6 +81,13 @@ func Serve(ctx context.Context, profiles []Profile, opts ServeOptions) error {
 }
 
 const defaultDrainTimeout = 60 * time.Second
+
+// serveBackendLifetime keeps ctx's values but not its cancellation. Every request handler stops
+// when the backend's lifetime ends, and ctx ends on the signal that stops the server, so with ctx
+// itself a SIGTERM cancelled every running request before the drain began: on 2026-10-10 06:57 the
+// drain found 2 running and "waited 2ms". The backend now stops when Serve's deferred Close cancels
+// it, which runs after the drain.
+func serveBackendLifetime(ctx context.Context) context.Context { return context.WithoutCancel(ctx) }
 
 // serverNames are the addresses the server's certificate vouches for: the one it listens on, and
 // loopback, so a client can reach it through a local tunnel (an SSH or SSM port forward, a
