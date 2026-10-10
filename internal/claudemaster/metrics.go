@@ -43,7 +43,7 @@ import (
 type TelemetryOptions struct {
 	Endpoint      string        // OTLP/HTTP base URL, e.g. http://127.0.0.1:4318; empty disables export
 	Interval      time.Duration // export interval (default 30 s)
-	Instance      string        // service.instance.id (default: the hostname)
+	Instance      string        // service.instance.id; empty adds none (the command line defaults it to the hostname)
 	AccountLabels map[string]string
 	Reader        sdkmetric.Reader // tests supply a manual reader instead of the OTLP exporter
 }
@@ -134,8 +134,8 @@ func StartTelemetry(opts TelemetryOptions) (func(context.Context) error, error) 
 		}
 		reader = sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(interval))
 	}
-	// Resource attributes can become dimensions downstream, and one server needs no instance id: it is added
-	// only when one is configured.
+	// Resource attributes can become dimensions downstream; the instance id keeps several servers' series
+	// apart and is added only when there is one.
 	resAttrs := []attribute.KeyValue{attribute.String("service.name", "claude-master")}
 	if opts.Instance != "" {
 		resAttrs = append(resAttrs, attribute.String("service.instance.id", opts.Instance))

@@ -182,11 +182,12 @@ func run(args []string) (int, error) {
 	var logLevel, logFile, logFormat string
 	var logMaxMB, logKeep int
 	var quotaLogInterval, otlpInterval time.Duration
-	var otlpEndpoint, accountLabelsFile string
+	var otlpEndpoint, accountLabelsFile, instance string
 	var accountLabels stringListFlag
 	if command == "run" || command == "serve" {
 		flags.StringVar(&otlpEndpoint, "otlp-endpoint", os.Getenv("CLAUDE_MASTER_OTLP_ENDPOINT"), "export OpenTelemetry metrics to this OTLP/HTTP base URL, e.g. http://127.0.0.1:4318")
 		flags.DurationVar(&otlpInterval, "otlp-interval", 30*time.Second, "how often metrics are exported")
+		flags.StringVar(&instance, "instance", "", "this process's service.instance.id in metrics, so several servers stay apart (default: the hostname)")
 		flags.Var(&accountLabels, "account-label", "name an incoming user's Anthropic account in metrics: ACCOUNT_UUID=NAME (repeatable; see: claude-master account-key)")
 		flags.StringVar(&accountLabelsFile, "account-labels-file", "", "a file of ACCOUNT_UUID=NAME lines")
 		flags.StringVar(&logLevel, "log-level", "", "debug, info, warn, error or off (default: info for serve, off for run)")
@@ -249,7 +250,7 @@ func run(args []string) (int, error) {
 		if err != nil {
 			return 2, err
 		}
-		stopTelemetry, err := claudemaster.StartTelemetry(claudemaster.TelemetryOptions{Endpoint: otlpEndpoint, Interval: otlpInterval, AccountLabels: labels})
+		stopTelemetry, err := claudemaster.StartTelemetry(claudemaster.TelemetryOptions{Endpoint: otlpEndpoint, Interval: otlpInterval, Instance: metricInstance(instance, os.Hostname), AccountLabels: labels})
 		if err != nil {
 			return 2, err
 		}
@@ -462,6 +463,18 @@ var accountIDPattern = regexp.MustCompile(`^[0-9a-fA-F-]{8,64}$`)
 
 // loadAccountLabels reads ACCOUNT_UUID=NAME pairs from flags and an optional file. The UUID is only a key
 // into a lookup table: metrics carry the name, never the id.
+// metricInstance is the service.instance.id metrics carry: --instance when given, else the hostname,
+// else none.
+func metricInstance(flag string, hostname func() (string, error)) string {
+	if instance := strings.TrimSpace(flag); instance != "" {
+		return instance
+	}
+	if name, err := hostname(); err == nil {
+		return strings.TrimSpace(name)
+	}
+	return ""
+}
+
 func loadAccountLabels(pairs []string, file string) (map[string]string, error) {
 	labels := make(map[string]string)
 	add := func(line string) error {

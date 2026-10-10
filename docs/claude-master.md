@@ -511,7 +511,9 @@ backs that discipline up by masking secret-shaped keys and values.
 
 `serve` and `run` can export metrics over OTLP/HTTP to anything that accepts it (a CloudWatch agent, an
 OpenTelemetry Collector): `--otlp-endpoint http://127.0.0.1:4318 --otlp-interval 30s`. Nothing in claude-master
-is specific to a cloud.
+is specific to a cloud. Every metric carries the resource attributes `service.name` (`claude-master`) and
+`service.instance.id`, which is `--instance NAME` or by default the hostname, so several servers exporting to one
+backend stay apart.
 
 ```bash
 # which dashboard key is which Anthropic account? (the account id is never exported, only this key)
@@ -557,7 +559,8 @@ attributes (a test enforces it). You can still split by any one axis, and `infer
 profile x account x status; what you give up is the full cross-product (say, one model on one box for one user).
 Through the CloudWatch agent: counters arrive as deltas (a Sum is a count), histograms as approximate statistic
 sets (Sum, SampleCount and Min/Max, no percentiles: use `inference.duration_quantile`), and the resource's
-`service.name` is an extra dimension.
+`service.name` and `service.instance.id` are extra dimensions (a query that names a metric's exact dimension set,
+such as a Metrics Insights `SCHEMA(...)`, includes both).
 
 **Bounded by design.** The model and the user's account come from the client's request, so neither is used as
 written. A `model` must look like a Claude model name (it contains `claude`) and at most 64 distinct ones are
