@@ -555,6 +555,10 @@ claude-master account-key 11111111-2222-3333-4444-555555555555     # -> acct-666
 claude-master serve ... --account-label 11111111-2222-3333-4444-555555555555=colton --account-labels-file labels.txt
 ```
 
+`serve` looks at `--account-labels-file` every minute and, when the file has changed (replace it with a rename),
+loads it again and swaps the labels in: no restart. A file with a line that is not `ACCOUNT_UUID=NAME` is not
+loaded; the labels already in use stay and the log says why.
+
 **Dimensions.** `profile` (the subscription profile's own name, or `api-backup`), `client` (the connecting box's
 certificate name, `tunnel` on the open listener), **`client_account`** (the INCOMING user's Anthropic account: your
 label, else `acct-` and 8 hex of a hash; `unknown` when the request has none), `model`, `status_class`, `status`,

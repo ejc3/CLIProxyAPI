@@ -258,6 +258,11 @@ func run(args []string) (int, error) {
 		if err != nil {
 			return 2, err
 		}
+		if command == "serve" && accountLabelsFile != "" {
+			go claudemaster.WatchAccountLabels(ctx, accountLabelsFile, accountLabelsCheckInterval, func() (map[string]string, error) {
+				return loadAccountLabels(accountLabels, accountLabelsFile)
+			})
+		}
 		defer func() {
 			// No deadline of ours (repository policy). If a collector hangs the final export, the service
 			// manager's stop timeout ends the process.
@@ -516,6 +521,9 @@ func loadAccountLabels(pairs []string, file string) (map[string]string, error) {
 	}
 	return labels, nil
 }
+
+// accountLabelsCheckInterval is how often serve looks at --account-labels-file for a change.
+const accountLabelsCheckInterval = time.Minute
 
 // runAccountKey prints the key the dashboards use for an Anthropic account id, so a label can be written
 // for it: claude-master account-key UUID...
