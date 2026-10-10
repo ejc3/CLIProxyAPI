@@ -94,6 +94,7 @@ type Backend struct {
 	authIDs        []string
 	seriesSelector *backendSeriesSelector
 	quotaPollDone  <-chan struct{}
+	backupDone     <-chan struct{} // the API-key backup's periodic credit check
 	observeDone    <-chan struct{}
 	stores         []*backendStore
 	cancel         context.CancelFunc
@@ -229,7 +230,11 @@ func newBackend(ctx context.Context, credentials []BackendCredential, modelName 
 	switch provider {
 	case "claude":
 		executor := newSharedClaudeExecutor(runtimeexecutor.NewClaudeExecutor(cfg), stores)
-		manager.RegisterExecutor(withBackendUpstreamRecording(executor))
+		manager.RegisterExecutor(withBackendUpstreamRecordingObserved(executor, func(authID string, record *backendUpstreamError) {
+			if seriesSelector != nil {
+				seriesSelector.noteBackupUpstream(authID, record)
+			}
+		}))
 		if quotaRequest == nil {
 			quotaRequest = manager.HttpRequest // the default requester, resolved here so the cache wraps it
 		}
@@ -281,6 +286,9 @@ func newBackend(ctx context.Context, credentials []BackendCredential, modelName 
 	if pollQuota {
 		backend.quotaPollDone = startBackendQuotaPolling(runCtx, manager, seriesSelector, subscriptionAuthIDs, quotaRequest, nil)
 	}
+	if seriesSelector != nil && backupAuthID != "" {
+		backend.backupDone = startBackupCreditChecks(runCtx, seriesSelector, newBackupCreditCheck(backupAPIKey, backendBackupCheckBaseURL, &http.Client{Timeout: 20 * time.Second}), nil)
+	}
 	if seriesSelector != nil {
 		subscriptions := make([]string, 0, len(subscriptionAuthIDs))
 		for _, id := range subscriptionAuthIDs {
@@ -303,6 +311,9 @@ func (b *Backend) Close() error {
 	}
 	b.once.Do(func() {
 		b.cancel()
+		if b.backupDone != nil {
+			<-b.backupDone
+		}
 		if b.quotaPollDone != nil {
 			<-b.quotaPollDone
 		}
@@ -708,6 +719,11 @@ type backendSeriesSelector struct {
 	rateLimited map[string]bool
 	stats       *selectorStats
 	limiter     *every
+
+	// The API-key backup's health (backend_backup_health.go). Unknown until the first check, which runs at start.
+	backupChecked     bool
+	backupUnavailable bool
+	backupWhy         string
 }
 
 // Pick chooses an account for a request and then records the decision (log and metrics).
@@ -742,7 +758,7 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 	s.initializeLocked()
 	// A paid API credential is not subscription capacity: do not use it to
 	// bypass the ten-percent reserve or an ordinary provider/request failure.
-	if switchable && s.backupAuthID != "" && !backendAttemptFailed(ctx, "", backendAvailabilityModel(model, opts)) && s.subscriptionsExhaustedLocked() {
+	if switchable && s.backupAuthID != "" && s.backupUsableLocked() && !backendAttemptFailed(ctx, "", backendAvailabilityModel(model, opts)) && s.subscriptionsExhaustedLocked() {
 		return s.pickBackupLocked(ctx, model, opts, auths, sessionID)
 	}
 	excludedAuthID := ""

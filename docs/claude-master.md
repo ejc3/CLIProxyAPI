@@ -160,6 +160,13 @@ standard API-key variable and removes it from native startup, so Claude Code con
 to use its normal subscription login and Remote Control. An explicit file or environment
 source overrides the optional dedicated environment variable.
 
+The backup is used only while it can pay. claude-master checks it at start and every five minutes with a
+token count (not billed; an organization with no credit is refused there too), and marks it unavailable at
+once when a real request to it is refused for credit. While it is unavailable the pool behaves as if there
+were no backup: a session gets Anthropic's weekly-limit 429 with `retry-after` and waits, instead of the
+credit error. The next check that passes brings it back. The log says each change (`API-key backup
+available` / `unavailable`) and the routing summary carries `backup=`.
+
 ### Optional exact model mappings
 
 Use repeatable `--map INCOMING:TARGET` options before `--` to change a model explicitly:

@@ -297,7 +297,7 @@ func (s *backendSeriesSelector) logSnapshot(interval time.Duration) {
 	}
 	sort.Strings(names)
 	attrs := []any{"interval", interval.String(), "switches", stats.switches, "backup_picks", stats.backup,
-		"rate_limited", stats.rateLimit, "refused", stats.refusals, "relayed", stats.relayed}
+		"rate_limited", stats.rateLimit, "refused", stats.refusals, "relayed", stats.relayed, "backup", s.backupStateLocked()}
 	for _, name := range names {
 		attrs = append(attrs, "requests_"+name, stats.picks[name])
 	}
