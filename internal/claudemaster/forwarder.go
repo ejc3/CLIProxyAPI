@@ -24,6 +24,14 @@ type upstreamDialer func(ctx context.Context) (net.Conn, error)
 // forwarderUser is the user name in the forwarder's proxy URL; only the password is checked.
 const forwarderUser = "claude-master"
 
+// forwarderDial reaches a tunnel's far end directly. The forwarder gym replaces it to stand in
+// for the internet.
+var forwarderDial = (&net.Dialer{}).DialContext
+
+// forwarderStarted, when set, is told of each forwarder a launch starts; the gym uses it to check
+// the forwarder is closed when Claude exits.
+var forwarderStarted func(*localForwarder)
+
 // localForwarder is the proxy Claude is given: plain HTTP on a loopback port of this box. A CONNECT
 // to api.anthropic.com that carries this launch's token goes on to the claude-master proxy; every
 // other CONNECT is dialled from this box and relayed blind. So the commands, hooks and servers Claude
@@ -51,10 +59,15 @@ func startLocalForwarder(upstream upstreamDialer) (*localForwarder, error) {
 	if err != nil {
 		return nil, errors.New("cannot bind the local forwarder")
 	}
+	return serveLocalForwarder(listener, upstream), nil
+}
+
+// serveLocalForwarder serves on listener, which it owns from here on.
+func serveLocalForwarder(listener net.Listener, upstream upstreamDialer) *localForwarder {
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &localForwarder{
 		listener: listener, token: rand.Text(), upstream: upstream,
-		dial: (&net.Dialer{}).DialContext, ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{}),
+		dial: forwarderDial, ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{}),
 	}
 	f.server = &http.Server{
 		Handler: http.HandlerFunc(f.handle), BaseContext: func(net.Listener) context.Context { return ctx },
@@ -62,7 +75,10 @@ func startLocalForwarder(upstream upstreamDialer) (*localForwarder, error) {
 	}
 	f.wg.Add(1)
 	go func() { defer f.wg.Done(); _ = f.server.Serve(listener) }()
-	return f, nil
+	if forwarderStarted != nil {
+		forwarderStarted(f)
+	}
+	return f
 }
 
 // URL carries the token, a private capability: it goes into Claude's environment only, never into
