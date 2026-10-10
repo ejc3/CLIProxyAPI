@@ -693,6 +693,10 @@ func proxyControlPath(method, path string) bool {
 	if path == "/v1/code/auth/refresh" || path == "/v1/oauth/token" {
 		return method == http.MethodPost
 	}
+	// WebFetch asks whether a domain may be fetched before fetching it; it carries no credential.
+	if path == "/api/web/domain_info" {
+		return method == http.MethodGet
+	}
 	if strings.HasPrefix(path, "/v1/code/runners/self-hosted/") {
 		return method == http.MethodGet || method == http.MethodPost || method == http.MethodDelete
 	}
