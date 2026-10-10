@@ -810,6 +810,10 @@ func proxyControlPath(method, path string) bool {
 	if path == "/api/hello" {
 		return method == http.MethodGet || method == http.MethodHead
 	}
+	// The MCP artifacts feature (Claude Code 2.1.296): reviewed when it first appeared; not inference.
+	if path == "/api/artifacts/mcp" || path == "/v1/code/mcp/ccr-artifacts" {
+		return true
+	}
 	if strings.HasPrefix(path, "/v1/code/runners/self-hosted/") {
 		return method == http.MethodGet || method == http.MethodPost || method == http.MethodDelete
 	}

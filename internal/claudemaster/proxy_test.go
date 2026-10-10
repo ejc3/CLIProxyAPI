@@ -571,6 +571,8 @@ func TestProxyControlRouteInventory(t *testing.T) {
 		{"POST", "/api/claude_code/unknown", false},
 		{"GET", "/api/web/domain_info", true},
 		{"GET", "/api/hello", true},
+		{"POST", "/api/artifacts/mcp", true},
+		{"GET", "/v1/code/mcp/ccr-artifacts", true},
 		{"HEAD", "/api/hello", true},
 		{"POST", "/api/hello", false},
 		{"GET", "/api/hello/extra", false},
