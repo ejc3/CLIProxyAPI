@@ -94,6 +94,7 @@ type Proxy struct {
 	counters    proxyCounters
 
 	clients sync.Map // inner *tls.Conn -> the client's name (see proxy_observe.go)
+	routes  sync.Map // route shapes already logged by noteRoute
 	seen    sync.Map // client name -> first connection logged
 }
 
@@ -561,15 +562,94 @@ func (p *Proxy) handleAPI(w http.ResponseWriter, r *http.Request) {
 		p.control.ServeHTTP(w, r)
 		return
 	}
-	if !proxyControlPath(r.Method, path) {
-		p.counters.blockedRequests.Add(1)
-		// Never send an unknown/future inference endpoint to the master account.
-		http.Error(w, "unrecognized control endpoint; request blocked", http.StatusForbidden)
+	// Remote Control's environment routes keep their audited exact rules: an unknown one there fails closed.
+	if path == "/v1/environments" || strings.HasPrefix(path, "/v1/environments/") {
+		if !proxyControlPath(r.Method, path) {
+			p.counters.blockedRequests.Add(1)
+			http.Error(w, "unrecognized Remote Control environment request; request blocked", http.StatusForbidden)
+			return
+		}
+		p.counters.controlRequests.Add(1)
+		observeControl(r)
+		p.control.ServeHTTP(w, r)
 		return
+	}
+	if !proxyControlPath(r.Method, path) {
+		// Never send a route that may spend tokens to the session's own account: that would spend the person's
+		// own allowance instead of the pool's.
+		if proxyInferenceLike(path) {
+			p.counters.blockedRequests.Add(1)
+			p.noteRoute(false, r.Method, path)
+			http.Error(w, "unlisted route that may spend tokens; request blocked", http.StatusForbidden)
+			return
+		}
+		// Any other Anthropic route goes through on the session's own login, as a known control route does, so a
+		// new Claude Code release that calls a new endpoint keeps working (2.1.296's /api/hello was refused and
+		// stopped every interactive start, 2026-10-10). The first request of each route shape is logged.
+		p.noteRoute(true, r.Method, path)
 	}
 	p.counters.controlRequests.Add(1)
 	observeControl(r)
 	p.control.ServeHTTP(w, r)
+}
+
+// proxyInferenceLike: an unlisted route that may spend tokens, so it must not run on the session's own
+// account. Unlisted routes pass only in Claude Code's own control plane (/v1/code/...), claude.ai's /api/...
+// routes and the MCP registry, and even there not when the path names inference (messages, completions,
+// generation, batches, agent proxying). The rest of the public API surface (/v1 outside /v1/code, any other
+// version) may bill and stays closed. Remote Control's environment routes never reach here: they keep their
+// exact rules.
+func proxyInferenceLike(path string) bool {
+	lower := strings.ToLower(path)
+	for _, word := range []string{"messages", "complet", "inference", "generat", "batches", "agent-proxy"} {
+		if strings.Contains(lower, word) {
+			return true
+		}
+	}
+	for _, open := range []string{"/v1/code/", "/api/", "/mcp-registry/"} {
+		if strings.HasPrefix(path, open) {
+			return false
+		}
+	}
+	return true
+}
+
+// noteRoute logs the first request of each route shape this process passes through (relayed) or refuses
+// as inference-like (blocked): the method and the path with id-like segments replaced, never a query or an
+// id. The CloudWatch alarms UnlistedRoute and BlockedRoute are metric filters on these two lines.
+func (p *Proxy) noteRoute(relayed bool, method, path string) {
+	shape := proxyRouteShape(path)
+	kind := "blocked"
+	if relayed {
+		kind = "relayed"
+	}
+	if _, seen := p.routes.LoadOrStore(kind+" "+method+" "+shape, struct{}{}); seen {
+		return
+	}
+	if relayed {
+		lg().Info("relayed an unlisted Anthropic route", "method", method, "route", shape)
+		return
+	}
+	lg().Warn("blocked an inference-like route", "method", method, "route", shape)
+}
+
+// proxyRouteShape replaces id-like segments (with a digit, or longer than 24 characters) by :id; an API
+// version segment (v1, v0) is kept.
+func proxyRouteShape(path string) string {
+	segments := strings.Split(path, "/")
+	for i, segment := range segments {
+		if proxyVersionSegment(segment) {
+			continue
+		}
+		if len(segment) > 24 || strings.ContainsAny(segment, "0123456789") {
+			segments[i] = ":id"
+		}
+	}
+	shape := strings.Join(segments, "/")
+	if len(shape) > 120 {
+		shape = shape[:120]
+	}
+	return shape
 }
 
 // The legacy namespace also hosts managed agents. Permit only the native BYOC
@@ -831,4 +911,16 @@ func (listener *proxyListener) Addr() net.Addr { return listener.addr }
 func (p *Proxy) metricsState() stateSnapshot {
 	snap := p.Snapshot()
 	return stateSnapshot{ActiveConns: int64(snap.ActiveConnections), HasActiveConns: true}
+}
+
+func proxyVersionSegment(segment string) bool {
+	if len(segment) < 2 || len(segment) > 3 || segment[0] != 'v' {
+		return false
+	}
+	for _, c := range segment[1:] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }

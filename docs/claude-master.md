@@ -36,9 +36,14 @@ parse/rebuild, or synthesize SSE events. HTTP
 hop-by-hop fields and connection framing are necessarily regenerated for the local
 connection.
 
-Known control and Remote Control routes continue to Anthropic with the master login.
-Unknown Anthropic routes fail closed instead of accidentally using the master account
-for inference. There is no Bedrock or master-account inference fallback. An explicitly
+Known control and Remote Control routes continue to Anthropic with the master login, and so does
+any other route of Claude Code's own control plane (`/v1/code/...`), claude.ai's `/api/...` and the
+MCP registry: a new Claude Code release that calls a new endpoint keeps working (each new route shape
+is logged once, `relayed an unlisted Anthropic route`). A route that may spend tokens never runs on the
+master account: the rest of the public API (`/v1` outside `/v1/code`, any other version) and any path
+naming messages, completions, generation, batches or agent proxying fail closed (logged once, `blocked
+an unlisted route that may spend tokens`). Remote Control's environment routes keep their exact rules,
+and an ambiguous or encoded path is refused before any of this. There is no Bedrock or master-account inference fallback. An explicitly
 provided Anthropic API key can serve as the final backup after subscription quota is
 exhausted; without one, inference stays subscription-only.
 

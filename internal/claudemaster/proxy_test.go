@@ -198,6 +198,9 @@ func TestProxyRejectsUnknownOrAmbiguousPaths(t *testing.T) {
 	}{
 		{"POST", "/v1/messages/batches", 403}, {"POST", "/v1/messages/", 403}, {"POST", "/v1/complete", 403},
 		{"POST", "/v1/responses", 403}, {"POST", "/v1/unknown", 403}, {"POST", "/api/claude_cli/new_inference", 403},
+		{"POST", "/v1/code/agent-proxy", 403}, {"POST", "/v1/code/agent-proxy/messages", 403}, {"GET", "/v2/messages", 403},
+		{"POST", "/v1/files", 403}, {"POST", "/api/claude_cli/generate_title", 403},
+		{"GET", "/v1/environments/bridge", 403}, {"POST", "/v1/environments/env_1/work/work_2/messages", 403},
 		{"GET", "/v1/messages", 405}, {"GET", "/v1/messages/count_tokens", 405},
 		{"POST", "/v1/%6dessages", 400}, {"POST", "/v1/messages%2Fcount_tokens", 400},
 		{"POST", "/v1/code/sessions/../../messages", 400}, {"POST", "//v1/messages", 400},
@@ -772,5 +775,45 @@ func TestProxyRelaysTheWebFetchDomainCheck(t *testing.T) {
 	}
 	if snapshot := p.Snapshot(); snapshot.ControlRequests != 1 || snapshot.BlockedRequests != 0 || snapshot.InferenceRequests != 0 {
 		t.Fatalf("snapshot = %+v, want one control request", snapshot)
+	}
+}
+
+// An unlisted route outside the token-spending surface goes through on the session's own login (a new Claude
+// Code release keeps working); each shape is noted once. Inference-like ones are refused and never reach
+// Anthropic or the pool.
+func TestProxyRelaysUnlistedControlRoutesAndNotesEachShapeOnce(t *testing.T) {
+	var seen []string
+	control := proxyTestTransport(func(r *http.Request) (*http.Response, error) {
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		return proxyTestResponse(http.StatusOK, `{}`), nil
+	})
+	p, client, _ := proxyTestStart(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("an unlisted route reached the pool") }), control)
+	for _, path := range []string{"/api/claude_code/new_feature", "/v1/code/mcp/ccr-artifacts", "/api/artifacts/mcp", "/mcp-registry/v0/servers"} {
+		resp, _ := proxyTestRequest(t, client, http.MethodGet, path, "", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s = %d, want relayed", path, resp.StatusCode)
+		}
+	}
+	if len(seen) != 4 || seen[1] != "GET /v1/code/mcp/ccr-artifacts" {
+		t.Fatalf("Anthropic saw %v", seen)
+	}
+	if snapshot := p.Snapshot(); snapshot.ControlRequests != 4 || snapshot.BlockedRequests != 0 {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+	// once per shape: two ids of the same route are one shape
+	p.noteRoute(true, "GET", "/v1/code/sessions/abc123/extra")
+	p.noteRoute(true, "GET", "/v1/code/sessions/def456/extra")
+	count := 0
+	p.routes.Range(func(k, _ any) bool {
+		if strings.Contains(k.(string), "/v1/code/sessions/:id/extra") {
+			count++
+		}
+		return true
+	})
+	if count != 1 {
+		t.Fatalf("route shapes noted %d times, want 1", count)
+	}
+	if got := proxyRouteShape("/v1/code/sessions/session_01ABCdefGHIjklMNOpqrSTUvw/events"); got != "/v1/code/sessions/:id/events" {
+		t.Fatalf("shape %q", got)
 	}
 }
