@@ -860,6 +860,7 @@ func (s *backendSeriesSelector) boundUnavailableErrorLocked(ctx context.Context,
 	}
 	refusal := &backendRefusalError{kind: backendRefusalUnavailable, authID: boundID, model: model}
 	if status, failed := backendAttemptStatus(ctx, boundID, model); failed {
+		refusal.relayed = status != 0
 		switch {
 		case status == http.StatusNotFound && backendUpstreamErrorFrom(ctx).notFoundWithoutAnthropicError():
 			// Not "model not found": Anthropic names that. Retried once already (backendRetryNotFound).

@@ -47,6 +47,7 @@ type backendRefusalError struct {
 	reason  string
 	resetAt time.Time // quota: when the earliest subscription resets, for retry-after
 	authID  string    // bound-subscription refusals: which subscription, for the remembered upstream error
+	relayed bool      // Anthropic answered this request with an error, and the session receives that error as sent
 	model   string
 	cause   error
 }

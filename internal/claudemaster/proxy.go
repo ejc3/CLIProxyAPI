@@ -85,9 +85,9 @@ type Proxy struct {
 	control     *httputil.ReverseProxy
 	mu          sync.Mutex
 	closed      bool
-	draining    bool           // Drain has begun: new inference requests get a retryable 529
-	inflight    sync.WaitGroup // inference requests being served (the listeners are in wg, not here)
-	running     atomic.Int64   // the same count, for the log
+	draining    bool         // Drain has begun
+	balanced    bool         // a load balancer stops sending new connections here once a rollout begins
+	running     atomic.Int64 // inference requests being served (the listeners are in wg, not here)
 	conns       map[*proxyConn]struct{}
 	wg          sync.WaitGroup
 	closeOnce   sync.Once
@@ -222,18 +222,25 @@ func (p *Proxy) Snapshot() ProxyStats {
 	}
 }
 
-// beginInference admits an inference request unless the proxy is draining or closed. The
-// count is taken under the lock that Drain sets draining under, so no request joins after
-// Drain has started waiting.
+// beginInference admits an inference request unless the proxy is closed, or draining without a
+// balancer in front. Behind a balancer a draining proxy keeps serving the connections it has (the
+// balancer sends new ones elsewhere), and each response closes its connection (handleAPI), so the
+// client's next request opens a new one through the balancer.
 func (p *Proxy) beginInference() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.draining || p.closed {
+	if p.closed || (p.draining && !p.balanced) {
 		return false
 	}
-	p.inflight.Add(1)
 	p.running.Add(1)
 	return true
+}
+
+// setBalanced says a load balancer is in front (serve --balanced).
+func (p *Proxy) setBalanced(balanced bool) {
+	p.mu.Lock()
+	p.balanced = balanced
+	p.mu.Unlock()
 }
 
 func (p *Proxy) isDraining() bool {
@@ -242,10 +249,7 @@ func (p *Proxy) isDraining() bool {
 	return p.draining
 }
 
-func (p *Proxy) endInference() {
-	p.running.Add(-1)
-	p.inflight.Done()
-}
+func (p *Proxy) endInference() { p.running.Add(-1) }
 
 // writeProxyRestarting answers an inference request that arrives while the server stops: what
 // Anthropic answers when it cannot take a request now (529 overloaded_error, x-should-retry), so
@@ -256,10 +260,13 @@ func writeProxyRestarting(w http.ResponseWriter) {
 	backendAnthropicError(w, 529, "overloaded_error", "claude-master is restarting; retry")
 }
 
-// Drain lets the requests already running finish before Close cancels them: new inference
-// requests are answered with a retryable 529 from now on, and Drain returns when the running
-// ones are done or timeout passes, whichever is first. Before this a restart cancelled every
-// running request at once and the session got a 499 it does not retry (2026-10-10 05:45).
+// Drain lets the requests already running finish before Close cancels them, and returns when
+// none is running or timeout passes, whichever is first. Without a balancer, new inference requests
+// are answered with a retryable 529 meanwhile; with one (serve --balanced), requests on the
+// connections this proxy already has are served and each closes its connection, so the client
+// moves to the other server without an error. Every response during a drain carries
+// Connection: close. Before this a restart cancelled every running request at once and the session
+// got a 499 it does not retry (2026-10-10 05:45).
 func (p *Proxy) Drain(timeout time.Duration) {
 	p.mu.Lock()
 	if p.closed || p.draining {
@@ -267,23 +274,39 @@ func (p *Proxy) Drain(timeout time.Duration) {
 		return
 	}
 	p.draining = true
+	balanced := p.balanced
 	p.mu.Unlock()
 	running := p.running.Load()
-	if running == 0 {
+	if running == 0 && !balanced {
 		lg().Info("proxy draining: no request running")
 		return
 	}
 	start := time.Now()
-	lg().Info("proxy draining", "running", running, "timeout", timeout)
-	done := make(chan struct{})
-	go func() { p.inflight.Wait(); close(done) }()
-	select {
-	case <-done:
-		lg().Info("proxy drained", "waited", time.Since(start).Round(time.Millisecond))
-	case <-time.After(timeout):
-		lg().Warn("proxy drain timed out; the requests still running are cancelled", "running", p.running.Load())
+	lg().Info("proxy draining", "running", running, "balanced", balanced, "timeout", timeout)
+	// Polled, not waited on: behind a balancer requests still start while draining. Two quiet
+	// samples in a row end it; a request that starts between the last sample and Close is
+	// cancelled, and a cancelled request is answered with a retryable 529.
+	deadline := start.Add(timeout)
+	quiet := 0
+	for {
+		if p.running.Load() == 0 {
+			quiet++
+			if quiet >= 2 {
+				lg().Info("proxy drained", "waited", time.Since(start).Round(time.Millisecond))
+				return
+			}
+		} else {
+			quiet = 0
+		}
+		if !time.Now().Before(deadline) {
+			lg().Warn("proxy drain timed out; the requests still running are cancelled", "running", p.running.Load())
+			return
+		}
+		time.Sleep(drainPoll)
 	}
 }
+
+var drainPoll = 25 * time.Millisecond
 
 // Close cancels handlers and closes both normal and CONNECT-hijacked sockets.
 // It is safe to call concurrently or more than once.
@@ -474,6 +497,11 @@ func proxyAuthority(authority string) (string, error) {
 }
 
 func (p *Proxy) handleAPI(w http.ResponseWriter, r *http.Request) {
+	if p.isDraining() {
+		// The client's next request opens a new connection, which the balancer (if any) sends to the
+		// server that is taking over.
+		w.Header().Set("Connection", "close")
+	}
 	p.counters.apiRequests.Add(1)
 	host := r.Host
 	if !strings.Contains(host, ":") {

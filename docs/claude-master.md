@@ -477,6 +477,22 @@ claude-master connect --open 127.0.0.1:8444 --ca ca.pem -- --remote-control
   instead of as a hang inside Claude.
 - Defaults come from `CLAUDE_MASTER_OPEN` and `CLAUDE_MASTER_CA`.
 
+### Stopping and rolling restarts
+
+A stopping server drains: requests already running get up to `--drain-timeout` (default 60s) to
+finish before they are cancelled, and a cancelled request is answered with a retryable `529
+overloaded_error`, never a 499, so Claude Code retries it. Keep the service manager's stop timeout
+(systemd `TimeoutStopSec`, default 90s) above the drain timeout.
+
+For restarts no session notices, run two servers behind a TCP load balancer on the same box (for
+example Envoy with a `tcp_proxy` listener on the client-facing address) and pass `--balanced` to
+both. A rollout starts the idle server, points the balancer's new connections at it, then stops the
+old one. A `--balanced` server that is draining keeps serving the connections it already has, and
+each response closes its connection, so the client's next request opens a new connection, which the
+balancer sends to the new server. Give the two servers distinct `--instance` names so their metrics
+stay apart, and the same `--state-dir`: the CA and the server certificate are shared, and the
+certificate must name the address clients dial (listen on that address with another port).
+
 ## Logging
 
 claude-master has its own log, separate from the upstream SDK's output (which stays discarded: it can carry

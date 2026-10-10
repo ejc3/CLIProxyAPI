@@ -150,3 +150,52 @@ func TestCancelledRequestIsARetryable529(t *testing.T) {
 		t.Fatalf("a 502 must stay a 502: %d", rec.Code)
 	}
 }
+
+// Behind a balancer a draining server keeps serving the connections it has, and closes each after
+// its response, so the client's next request opens a new connection (to the other server).
+func TestBalancedDrainServesExistingConnectionsAndClosesThem(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var first bool
+	proxy, transport := startDrainServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if !first {
+			first = true
+			close(entered)
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		_, _ = io.WriteString(w, "served")
+	})
+	proxy.setBalanced(true)
+	go func() { _, _, _, _ = drainPost(transport) }()
+	<-entered
+	drained := make(chan struct{})
+	go func() { proxy.Drain(5 * time.Second); close(drained) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for !proxy.isDraining() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	resp, err := client.Post("https://"+masterAPIHost+"/v1/messages", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "served" || !resp.Close {
+		t.Fatalf("a request during a balanced drain must be served and close its connection: %d %q close=%v", resp.StatusCode, body, resp.Close)
+	}
+	select {
+	case <-drained:
+		t.Fatal("Drain returned while a request was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-drained:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Drain did not return after the running request finished")
+	}
+}
