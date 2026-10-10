@@ -814,6 +814,30 @@ func proxyControlPath(method, path string) bool {
 	if path == "/api/artifacts/mcp" || path == "/v1/code/mcp/ccr-artifacts" {
 		return true
 	}
+	// Reviewed 2026-10-10 against every endpoint Claude Code 2.1.296 carries: settings, telemetry, onboarding,
+	// memory, plugins, frames, transcript sharing, voice, claude.ai MCP connectors, skills, design, the
+	// filestore reader and ultrareview's checks. None of them is inference the pool could serve; they belong
+	// on the person's own login. Before this the MCP connectors and the rest under /v1 were refused for every
+	// pooled session. Still closed: /v1/complete and /v1/messages/batches (inference), /v1/files (uploads
+	// would land on the person's account, where pooled inference cannot see them) and
+	// /v1/messages/cache_touch (it must reach the conversation's own subscription).
+	for _, prefix := range []string{
+		"/api/event_logging/", "/api/frame/", "/api/organizations/", "/api/users/",
+		"/v1/code/memory/", "/v1/code/local/memory/", "/v1/mcp/", "/v1/toolbox/shttp/mcp/", "/v1/design/",
+		"/v1/filestore/fs/", "/v1/ultrareview/",
+	} {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	switch path {
+	case "/api/claude_code/notification/preferences", "/api/claude_code/organizations/metrics_enabled",
+		"/api/claude_code/skills", "/api/claude_code_grove", "/api/claude_code_shared_session_transcripts",
+		"/api/directory/plugins", "/api/organization/claude_code_first_token_date", "/api/v2/rum",
+		"/api/ws/speech_to_text/voice_stream", "/v1/code/mcp/hearthbot",
+		"/v1/me", "/v1/organizations/spend_limits", "/v1/skills", "/v1/pages/mcp", "/v1/logs", "/v1/metrics", "/v1/traces":
+		return true
+	}
 	if strings.HasPrefix(path, "/v1/code/runners/self-hosted/") {
 		return method == http.MethodGet || method == http.MethodPost || method == http.MethodDelete
 	}
