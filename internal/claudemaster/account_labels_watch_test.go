@@ -36,9 +36,10 @@ func TestAccountLabelsReloadWhenTheFileChanges(t *testing.T) {
 	var mu sync.Mutex
 	label, fail := "alice", false
 	set := func(l string, f bool) { mu.Lock(); label, fail = l, f; mu.Unlock() }
+	start := accountLabelsFingerprint(file) // before the goroutine: the first replace below must read as a change
 	go func() {
 		defer close(done)
-		WatchAccountLabels(ctx, file, 10*time.Millisecond, func() (map[string]string, error) {
+		watchAccountLabelsFrom(ctx, file, start, 10*time.Millisecond, func() (map[string]string, error) {
 			mu.Lock()
 			defer mu.Unlock()
 			if fail {

@@ -13,7 +13,12 @@ import (
 // secret reaches the metrics without a restart. load reads and checks the labels; when it fails, the labels already in
 // use stay and the failure is logged once for that version of the file. It returns when ctx ends.
 func WatchAccountLabels(ctx context.Context, file string, every time.Duration, load func() (map[string]string, error)) {
-	last := accountLabelsFingerprint(file)
+	watchAccountLabelsFrom(ctx, file, accountLabelsFingerprint(file), every, load)
+}
+
+// watchAccountLabelsFrom is WatchAccountLabels with the starting fingerprint taken by the caller, so a change made
+// right after the call is never mistaken for the starting state.
+func watchAccountLabelsFrom(ctx context.Context, file, last string, every time.Duration, load func() (map[string]string, error)) {
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
