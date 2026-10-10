@@ -693,6 +693,8 @@ type backendSeriesSelector struct {
 	quota             map[string]backendWeeklyQuota
 	quotaRevision     map[string]uint64
 	quotaBlockedUntil map[string]time.Time
+	// fiveHour is the last polled five-hour window per account; it is reported, not used to route.
+	fiveHour          map[string]ClaudeFiveHourQuota
 	quotaBackoffLevel map[string]int
 	sessions          *coreauth.SessionCache
 	routes            *backendSessionStore
@@ -1336,7 +1338,16 @@ func loadBackendWeeklyQuotas(ctx context.Context, manager *coreauth.Manager, sel
 				}
 				auth = refreshed
 			}
-			quota, known, errQuota := FetchClaudeWeeklyQuota(ctx, auth, quotaRequest)
+			payload, errFetch := fetchClaudeUsage(ctx, auth, quotaRequest)
+			if errFetch == nil {
+				if fiveHour, okFiveHour, errFiveHour := ParseClaudeFiveHourQuota(payload); errFiveHour == nil && okFiveHour {
+					selector.observeFiveHourQuota(authID, fiveHour)
+				}
+			}
+			quota, known, errQuota := ClaudeWeeklyQuota{}, false, errFetch
+			if errFetch == nil {
+				quota, known, errQuota = ParseClaudeWeeklyQuota(payload)
+			}
 			if errQuota != nil || !known || ctx.Err() != nil {
 				if ctx.Err() == nil {
 					selector.noteUsagePoll(authID, backendUsagePollWhy(errQuota, known))

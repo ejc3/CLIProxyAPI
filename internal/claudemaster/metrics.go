@@ -86,6 +86,8 @@ type instruments struct {
 	quotaUsed         metric.Float64ObservableGauge
 	quotaResets       metric.Float64ObservableGauge
 	quotaBlocked      metric.Float64ObservableGauge
+	fiveHourUsed      metric.Float64ObservableGauge
+	fiveHourResets    metric.Float64ObservableGauge
 	tokenExpires      metric.Float64ObservableGauge
 	quotaBand         metric.Int64ObservableGauge
 	sessions          metric.Int64ObservableGauge
@@ -194,6 +196,8 @@ func buildInstruments(m metric.Meter, labels map[string]string) *instruments {
 	i.quotaUsed, _ = m.Float64ObservableGauge("claude_master.quota.used_fraction", metric.WithDescription("Weekly subscription allowance used, 0 to 1"))
 	i.quotaResets, _ = m.Float64ObservableGauge("claude_master.quota.resets_in_seconds", metric.WithUnit("s"))
 	i.quotaBlocked, _ = m.Float64ObservableGauge("claude_master.quota.rate_limited_for_seconds", metric.WithUnit("s"))
+	i.fiveHourUsed, _ = m.Float64ObservableGauge("claude_master.quota.five_hour.used_fraction", metric.WithDescription("Five-hour subscription window used, 0 to 1, from the usage poll; 0 once the window has reset"))
+	i.fiveHourResets, _ = m.Float64ObservableGauge("claude_master.quota.five_hour.resets_in_seconds", metric.WithUnit("s"), metric.WithDescription("Until the five-hour window resets; absent while no window is open"))
 	i.quotaBand, _ = m.Int64ObservableGauge("claude_master.quota.band", metric.WithDescription("0 ok, 1 reserve (last tenth), 2 exhausted, -1 unknown"))
 	i.tokenExpires, _ = m.Float64ObservableGauge("claude_master.auth.token_expires_in_seconds", metric.WithUnit("s"))
 	i.sessions, _ = m.Int64ObservableGauge("claude_master.sessions.tracked")
@@ -205,7 +209,7 @@ func buildInstruments(m metric.Meter, labels map[string]string) *instruments {
 	i.heap, _ = m.Int64ObservableGauge("claude_master.process.heap_bytes", metric.WithUnit("By"))
 
 	i.registration, _ = m.RegisterCallback(i.observe,
-		i.quotaUsed, i.quotaResets, i.quotaBlocked, i.quotaBand, i.tokenExpires, i.sessions, i.activeConns,
+		i.quotaUsed, i.quotaResets, i.quotaBlocked, i.fiveHourUsed, i.fiveHourResets, i.quotaBand, i.tokenExpires, i.sessions, i.activeConns,
 		i.upstreamLimit, i.latencyQuantile, i.uptime, i.goroutines, i.heap)
 	return i
 }
@@ -223,6 +227,11 @@ type profileState struct {
 	Band            int64
 	TokenExpiresIn  float64
 	TokenKnown      bool
+	// The five-hour window from the usage poll.
+	FiveHourUsed        float64
+	FiveHourKnown       bool
+	FiveHourResetsIn    float64
+	FiveHourResetsKnown bool
 }
 
 type stateSnapshot struct {
@@ -252,6 +261,12 @@ func (i *instruments) observe(_ context.Context, o metric.Observer) error {
 				o.ObserveFloat64(i.quotaResets, p.ResetsInSeconds, attrs)
 			}
 			o.ObserveFloat64(i.quotaBlocked, p.BlockedSeconds, attrs)
+			if p.FiveHourKnown {
+				o.ObserveFloat64(i.fiveHourUsed, p.FiveHourUsed, attrs)
+			}
+			if p.FiveHourResetsKnown {
+				o.ObserveFloat64(i.fiveHourResets, p.FiveHourResetsIn, attrs)
+			}
 			o.ObserveInt64(i.quotaBand, p.Band, attrs)
 			if p.TokenKnown {
 				o.ObserveFloat64(i.tokenExpires, p.TokenExpiresIn, attrs)
