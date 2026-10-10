@@ -37,9 +37,33 @@ variable "assign_public_ip" {
 }
 
 variable "port" {
-  description = "Port of the certificate-authenticated proxy listener."
+  description = "Port clients dial (Envoy listens here and passes TCP through to the active server)."
   type        = number
   default     = 8443
+}
+
+variable "server_ports" {
+  description = "The two servers behind Envoy, blue and green, each on its own port of private_ip (not opened in the security group). A rollout moves new connections from one to the other."
+  type        = object({ blue = number, green = number })
+  default     = { blue = 18443, green = 28443 }
+}
+
+variable "drain_seconds" {
+  description = "How long a stopping server lets running requests finish (serve --drain-timeout). Its unit's stop timeout is a minute longer."
+  type        = number
+  default     = 600
+}
+
+variable "envoy_version" {
+  description = "Envoy release (official linux-aarch_64 binary from github.com/envoyproxy/envoy). Pinned together with envoy_sha256."
+  type        = string
+  default     = "1.39.1"
+}
+
+variable "envoy_sha256" {
+  description = "SHA-256 of envoy-<envoy_version>-linux-aarch_64. The bootstrap refuses a download that does not match."
+  type        = string
+  default     = "8565ad0af4b1d1d3c986e5165c027add3073579182f398dd7f4d728d25e9ec62"
 }
 
 variable "profiles" {
@@ -51,13 +75,13 @@ variable "profiles" {
 variable "release_tag" {
   description = "Release of ejc3/CLIProxyAPI that carries the claude-master-linux-arm64 binary. Pinned together with binary_sha256: change both to roll forward."
   type        = string
-  default     = "claude-master-441e353"
+  default     = "claude-master-957ec56"
 }
 
 variable "binary_sha256" {
   description = "SHA-256 of the claude-master-linux-arm64 asset of release_tag. The bootstrap refuses a download that does not match."
   type        = string
-  default     = "3bf4e60705c910bf6b203f4f5c3e53c9cb0deb73ce4999a80c1ab2f36ef87656"
+  default     = "850334a53ad430ab06325c4fe6636286fa8f04b6ca69e70abfbc9909693ccd75"
 }
 
 variable "instance_type" {

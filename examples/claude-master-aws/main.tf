@@ -13,10 +13,15 @@ locals {
   tags = merge({ Project = var.name }, var.tags)
 
   user_data = templatefile("${path.module}/user-data.sh.tftpl", {
+    name              = var.name
     release_tag       = var.release_tag
     binary_sha256     = var.binary_sha256
     private_ip        = var.private_ip
     port              = var.port
+    server_ports      = var.server_ports
+    drain_seconds     = var.drain_seconds
+    envoy_version     = var.envoy_version
+    envoy_sha256      = var.envoy_sha256
     region            = var.region
     profiles          = var.profiles
     enable_cloudwatch = var.enable_cloudwatch

@@ -12,13 +12,14 @@ cp terraform.tfvars.example terraform.tfvars    # vpc_id, subnet_id, private_ip,
 terraform init && terraform apply
 ```
 
-Then log each subscription in (interactive, once per profile), start the service, and enrol your client boxes: see the guide.
+Then log each subscription in (interactive, once per profile), start the pool with `sudo claude-master-rollout`, and enrol your
+client boxes: see the guide. Later restarts are rollouts too: Envoy in front of two servers, so no session notices.
 
 | File | What it holds |
 |---|---|
 | `variables.tf` | Every input, with a description and a default where one is safe |
 | `main.tf` | Security group, IAM, log group, instance |
-| `user-data.sh.tftpl` | The bootstrap: service account, pinned binary, systemd unit, CloudWatch agent, helpers |
+| `user-data.sh.tftpl` | The bootstrap: service account, pinned binary, Envoy and the blue/green server units, rollout, CloudWatch agent, helpers |
 | `outputs.tf` | Instance id, proxy address, the per-profile login commands |
 
 Inputs without a default (`vpc_id`, `subnet_id`, `private_ip`, `client_cidrs`) must be set. The binary is pinned by

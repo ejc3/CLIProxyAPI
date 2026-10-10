@@ -24,7 +24,14 @@ talks to it. Clients hold no login and no password: they hold a short-lived cert
 | Security group | The proxy port from your client CIDRs, **nothing else inbound** (no SSH rule: use Session Manager). |
 | IAM role + instance profile | `AmazonSSMManagedInstanceCore`; optional CloudWatch publishing limited to one namespace and one log group; optional read of one secret (the paid API-key backup). |
 | CloudWatch log group (optional) | The proxy's own log, redacted at the source. |
-| Bootstrap (`user-data.sh.tftpl`) | Swap, a dedicated service account, the pinned binary (sha256-checked), the systemd unit, the optional CloudWatch agent, and three helpers: `claude-master-login`, `claude-master-sign`, `claude-master-status`. |
+| Bootstrap (`user-data.sh.tftpl`) | Swap, a dedicated service account, the pinned binary (sha256-checked), Envoy (pinned, sha256-checked) in front of two server units (`claude-master-server@blue`, `@green`), the optional CloudWatch agent, and helpers: `claude-master-login`, `claude-master-sign`, `claude-master-status`, `claude-master-rollout`. |
+
+**Restarts nobody notices.** Envoy listens on the port clients dial and passes TCP through, unchanged, to one of
+two servers on the box, each on its own port of the same address (the server certificate names the address clients
+dial; the two ports are not in the security group). `sudo claude-master-rollout` starts the idle server, points
+Envoy's new connections at it, and stops the old one, which drains (`serve --balanced`): it keeps serving the
+connections it has, each response closing its connection, so every client moves over on its next request without an
+error, and running requests get up to `drain_seconds` (default 600) to finish. That is how a new binary goes live.
 
 The service **stays idle until every profile has a login**, so the first apply creates a box that does nothing
 until you finish step 3 below.
@@ -73,7 +80,7 @@ that already has a login is refused, so a failed attempt is safe to repeat. Repe
 
 ```bash
 sudo claude-master-status        # every login: present
-sudo systemctl start claude-master-server
+sudo claude-master-rollout       # starts the first server behind Envoy
 sudo runuser -u claude-master -- env HOME=/var/lib/claude-master \
   claude-master probe claude-1 --model claude-haiku-4-5-20251001     # status=200 matched=true
 ```
@@ -123,9 +130,10 @@ aws ssm send-command --document-name AWS-RunShellScript \
   --instance-ids "$(terraform output -raw instance_id)" --parameters file://params.json
 ```
 
-The bootstrap is idempotent. It swaps the binary atomically, but it **never restarts a running server**: a restart
-interrupts every connected session. Restart when that is acceptable: `sudo systemctl restart claude-master-server`
-(`claude-master-status` shows installed against pinned).
+The bootstrap is idempotent. It swaps the binary atomically and **never restarts a running server or Envoy**. Put the
+new binary live with `sudo claude-master-rollout` (over Session Manager, or `aws ssm send-command` with
+`commands=["claude-master-rollout"]`): the idle server starts on it, new connections move to it, and the old server
+drains. No session notices. `claude-master-status` shows the active server and installed against pinned.
 
 ## Operating notes
 
