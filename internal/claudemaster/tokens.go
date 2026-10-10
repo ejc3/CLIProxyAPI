@@ -1,9 +1,16 @@
 package claudemaster
 
 import (
+	"bufio"
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
+	"io"
 	"strings"
 
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	"github.com/tidwall/gjson"
 )
 
@@ -40,10 +47,24 @@ type usageScanner struct {
 	size     int
 	counts   tokenCounts
 	seen     bool
+	decoded  *decodedUsage // a compressed body: its plain bytes are read by a scanner of their own
 }
 
-// start picks how to read the body from the response's status and content type.
-func (u *usageScanner) start(status int, contentType string) {
+// decodedUsage reads a compressed body. Anthropic answers compressed when the client allows it, and
+// the native path forwards the bytes as sent, so without this the scanner looked for usage in
+// compressed bytes and counted nothing: no token series at all for two hours after release
+// 09015c6 (2026-10-10). The bytes the client receives go into a pipe, a goroutine decodes them and
+// a plain scanner reads the result. The client's bytes are never changed; a body that does not
+// decode is drained to the end and counts nothing, so a write never blocks on it.
+type decodedUsage struct {
+	pipe   *io.PipeWriter
+	inner  usageScanner
+	done   chan struct{}
+	closed bool
+}
+
+// start picks how to read the body from the response's status, content type and content encoding.
+func (u *usageScanner) start(status int, contentType, contentEncoding string) {
 	switch {
 	case status < 200 || status >= 300:
 		u.mode = usageOff
@@ -54,9 +75,96 @@ func (u *usageScanner) start(status int, contentType string) {
 	default:
 		u.mode = usageOff
 	}
+	if u.mode == usageOff {
+		return
+	}
+	encodings := usageEncodings(contentEncoding)
+	if len(encodings) == 0 {
+		return
+	}
+	reader, writer := io.Pipe()
+	u.decoded = &decodedUsage{pipe: writer, inner: usageScanner{mode: u.mode}, done: make(chan struct{})}
+	go u.decoded.run(reader, encodings)
+}
+
+// usageEncodings is the Content-Encoding chain in the order it was applied, without identity.
+func usageEncodings(header string) []string {
+	var out []string
+	for _, enc := range strings.Split(header, ",") {
+		if enc = strings.ToLower(strings.TrimSpace(enc)); enc != "" && enc != "identity" {
+			out = append(out, enc)
+		}
+	}
+	return out
+}
+
+func (d *decodedUsage) run(compressed *io.PipeReader, encodings []string) {
+	defer close(d.done)
+	// Whatever the decoder does, keep reading until the response ends, so a write never blocks.
+	defer func() { _, _ = io.Copy(io.Discard, compressed); _ = compressed.Close() }()
+	var closers []func()
+	defer func() {
+		for i := len(closers) - 1; i >= 0; i-- {
+			closers[i]()
+		}
+	}()
+	var r io.Reader = compressed
+	for i := len(encodings) - 1; i >= 0; i-- {
+		switch encodings[i] {
+		case "gzip", "x-gzip":
+			gz, err := gzip.NewReader(r)
+			if err != nil {
+				return
+			}
+			closers = append(closers, func() { _ = gz.Close() })
+			r = gz
+		case "deflate":
+			// HTTP's deflate is zlib-wrapped; some servers send raw deflate. The zlib header tells.
+			buffered := bufio.NewReader(r)
+			if head, err := buffered.Peek(2); err == nil && head[0]&0x0f == 8 && (uint16(head[0])<<8|uint16(head[1]))%31 == 0 {
+				zr, err := zlib.NewReader(buffered)
+				if err != nil {
+					return
+				}
+				closers = append(closers, func() { _ = zr.Close() })
+				r = zr
+			} else {
+				fr := flate.NewReader(buffered)
+				closers = append(closers, func() { _ = fr.Close() })
+				r = fr
+			}
+		case "br":
+			r = brotli.NewReader(r)
+		case "zstd":
+			zd, err := zstd.NewReader(r)
+			if err != nil {
+				return
+			}
+			closers = append(closers, zd.Close)
+			r = zd
+		default:
+			return
+		}
+	}
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			d.inner.write(buf[:n])
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 func (u *usageScanner) write(b []byte) {
+	if d := u.decoded; d != nil {
+		if !d.closed {
+			_, _ = d.pipe.Write(b)
+		}
+		return
+	}
 	switch u.mode {
 	case usageSSE:
 		for len(b) > 0 {
@@ -129,6 +237,14 @@ func (u *usageScanner) apply(usage gjson.Result) {
 
 // result is the response's usage, once the body is complete.
 func (u *usageScanner) result() (tokenCounts, bool) {
+	if d := u.decoded; d != nil {
+		if !d.closed {
+			d.closed = true
+			_ = d.pipe.Close()
+			<-d.done
+		}
+		return d.inner.result()
+	}
 	if u.mode == usageJSON && len(u.tail) > 0 {
 		if u.size <= usageTailLimit {
 			u.apply(gjson.GetBytes(u.tail, "usage"))

@@ -3,6 +3,7 @@ package claudemaster
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -42,7 +43,7 @@ func (w *meteredWriter) WriteString(s string) (int, error) {
 // write, once the status and content type are final, whether and how to read the body.
 func (w *meteredWriter) observeBody(b []byte) {
 	if w.usage.mode == usageUndecided {
-		w.usage.start(w.Status(), w.Header().Get("Content-Type"))
+		w.usage.start(w.Status(), w.Header().Get("Content-Type"), strings.Join(w.Header().Values("Content-Encoding"), ","))
 	}
 	w.usage.write(b)
 }

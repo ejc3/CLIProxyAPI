@@ -24,7 +24,7 @@ var tokenTestWant = tokenCounts{input: 11, output: 25, cacheRead: 300, cacheCrea
 
 func scanUsage(status int, contentType string, chunks ...string) (tokenCounts, bool) {
 	var u usageScanner
-	u.start(status, contentType)
+	u.start(status, contentType, "")
 	for _, chunk := range chunks {
 		u.write([]byte(chunk))
 	}
@@ -60,7 +60,7 @@ func TestUsageScannerTakesTheCumulativeDelta(t *testing.T) {
 func TestUsageScannerPassesOverLongLinesWithoutHoldingThem(t *testing.T) {
 	long := "data: " + `{"type":"content_block_delta","delta":{"text":"` + strings.Repeat("x", 3*usageLineLimit) + `"}}` + "\n\n"
 	var u usageScanner
-	u.start(200, "text/event-stream")
+	u.start(200, "text/event-stream", "")
 	u.write([]byte(tokenTestSSE[:strings.Index(tokenTestSSE, "event: content_block_delta")]))
 	for i := 0; i < len(long); i += 4096 {
 		u.write([]byte(long[i:min(i+4096, len(long))]))
