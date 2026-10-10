@@ -101,7 +101,7 @@ type instruments struct {
 	goroutines        metric.Int64ObservableGauge
 	heap              metric.Int64ObservableGauge
 	startedAt         time.Time
-	accountLabelsMap  map[string]string
+	accountLabelsMap  atomic.Pointer[map[string]string] // swapped whole by SetAccountLabels
 }
 
 var activeInstruments atomic.Pointer[instruments]
@@ -145,10 +145,7 @@ func StartTelemetry(opts TelemetryOptions) (func(context.Context) error, error) 
 		return nil, err
 	}
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader), sdkmetric.WithResource(res))
-	labels := make(map[string]string, len(opts.AccountLabels))
-	for id, label := range opts.AccountLabels {
-		labels[strings.ToLower(strings.TrimSpace(id))] = strings.TrimSpace(label)
-	}
+	labels := normalizeAccountLabels(opts.AccountLabels)
 	inst := buildInstruments(provider.Meter("claude-master"), labels)
 	activeInstruments.Store(inst)
 	lg().Info("telemetry started", "endpoint_host", endpointHost(opts.Endpoint), "account_labels", len(labels))
@@ -162,7 +159,8 @@ func StartTelemetry(opts TelemetryOptions) (func(context.Context) error, error) 
 }
 
 func buildInstruments(m metric.Meter, labels map[string]string) *instruments {
-	i := &instruments{quantiles: newQuantileSet(512), limitGauges: newLimitGaugeStore(), startedAt: time.Now(), accountLabelsMap: labels}
+	i := &instruments{quantiles: newQuantileSet(512), limitGauges: newLimitGaugeStore(), startedAt: time.Now()}
+	i.accountLabelsMap.Store(&labels)
 	counter := func(name, desc string) metric.Int64Counter {
 		c, _ := m.Int64Counter(name, metric.WithDescription(desc))
 		return c
@@ -328,11 +326,33 @@ func clientAccountKey(raw []byte) string {
 	if id == "" {
 		return "unknown"
 	}
-	if label, ok := tm().accountLabelsMap[id]; ok && label != "" {
-		return sanitizeDimension(label) // bounded by the labels file
+	if labels := tm().accountLabelsMap.Load(); labels != nil {
+		if label, ok := (*labels)[id]; ok && label != "" {
+			return sanitizeDimension(label) // bounded by the labels file
+		}
 	}
 	sum := sha256.Sum256([]byte(id))
 	return accounts.admit("acct-"+hex.EncodeToString(sum[:4]), "other")
+}
+
+func normalizeAccountLabels(in map[string]string) map[string]string {
+	labels := make(map[string]string, len(in))
+	for id, label := range in {
+		labels[strings.ToLower(strings.TrimSpace(id))] = strings.TrimSpace(label)
+	}
+	return labels
+}
+
+// SetAccountLabels replaces the running telemetry's account labels (ACCOUNT_UUID -> NAME) in one swap, so
+// a changed labels file takes effect without a restart. It returns false when telemetry is not running.
+func SetAccountLabels(labels map[string]string) bool {
+	inst := activeInstruments.Load()
+	if inst == nil {
+		return false
+	}
+	normalized := normalizeAccountLabels(labels)
+	inst.accountLabelsMap.Store(&normalized)
+	return true
 }
 
 // AccountKeyFor is what the dashboards will call an account id: use it to build --account-label values

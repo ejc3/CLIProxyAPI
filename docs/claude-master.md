@@ -36,9 +36,13 @@ parse/rebuild, or synthesize SSE events. HTTP
 hop-by-hop fields and connection framing are necessarily regenerated for the local
 connection.
 
-Known control and Remote Control routes continue to Anthropic with the master login.
-Unknown Anthropic routes fail closed instead of accidentally using the master account
-for inference. There is no Bedrock or master-account inference fallback. An explicitly
+Inference (`POST /v1/messages`, `POST /v1/messages/count_tokens`) goes to the pool. Every other
+Anthropic route goes to Anthropic unchanged, on the session's own login, exactly as Claude Code
+would send it without claude-master: compatibility comes first, so a new Claude Code release that
+calls a new endpoint keeps working. claude-master adds no credential to these requests, so relaying
+them grants nothing. A route not in the reviewed list (`proxyControlPath`) is logged once per shape
+(`relayed an unlisted Anthropic route`, method and path with ids replaced). Only an ambiguous or
+encoded path, or the pool's own routes with the wrong method, are refused. There is no Bedrock or master-account inference fallback. An explicitly
 provided Anthropic API key can serve as the final backup after subscription quota is
 exhausted; without one, inference stays subscription-only.
 
@@ -156,6 +160,13 @@ standard API-key variable and removes it from native startup, so Claude Code con
 to use its normal subscription login and Remote Control. An explicit file or environment
 source overrides the optional dedicated environment variable.
 
+The backup is used only while it can pay. claude-master checks it at start and every five minutes with a
+token count (not billed; an organization with no credit is refused there too), and marks it unavailable at
+once when a real request to it is refused for credit. While it is unavailable the pool behaves as if there
+were no backup: a session gets Anthropic's weekly-limit 429 with `retry-after` and waits, instead of the
+credit error. The next check that passes brings it back. The log says each change (`API-key backup
+available` / `unavailable`) and the routing summary carries `backup=`.
+
 ### Optional exact model mappings
 
 Use repeatable `--map INCOMING:TARGET` options before `--` to change a model explicitly:
@@ -205,8 +216,13 @@ it does not turn a five-hour rejection into exhausted weekly usage. Request-scop
 model-scoped, authentication, validation, and transport failures do not drain or rotate
 the account.
 
-After startup, the usage API is polled every 60 seconds for all subscription profiles,
-never the API-key backup. This retries failed startup reads and picks up weekly resets,
+After startup, the usage API is polled about every 3 minutes (each round jittered 20% either
+way) for all subscription profiles, never the API-key backup. The profiles do not ask at once:
+each waits its own fixed phase after the round starts, spread across the first half of the
+interval. Anthropic limits this endpoint per account (polled every minute, every other request
+was refused with 429), so a 429 holds that profile's poll back for its `Retry-After`, or one
+more interval without one, at most 15 minutes. Busy profiles are also updated from every
+inference response's rate-limit headers; the poll keeps idle ones and reset times current. This retries failed startup reads and picks up weekly resets,
 quota grants, and usage from other processes. Accounts are queried independently, with
 at most one usage request in flight per account, so a stalled account does not stop
 the others from updating. Failed or unknown responses keep the last known quota.
@@ -319,8 +335,9 @@ later request.
   - a 401 adopts a newer saved credential, or rotates under the lock (at most once per 30 seconds
     per launcher), then retries once before any response is exposed;
   - a save never writes older tokens over newer ones;
-  - the usage poll is served from a short-lived cache file (`auth.usage`, 45 s) when another
-    launcher fetched it, so N launchers make about one usage request a minute per account.
+  - the usage poll is served from a short-lived cache file (`auth.usage`, 2 minutes, shorter
+    than the shortest jittered interval) when another launcher fetched it, so N launchers make about
+    one usage request per interval per account.
   The kernel releases the lock when its holder dies, so a crashed launcher cannot wedge the rest.
   Conversation routing records are one file per session and need no coordination. A Codex profile
   keeps the old rule of one launcher at a time.
@@ -477,6 +494,22 @@ claude-master connect --open 127.0.0.1:8444 --ca ca.pem -- --remote-control
   instead of as a hang inside Claude.
 - Defaults come from `CLAUDE_MASTER_OPEN` and `CLAUDE_MASTER_CA`.
 
+### Stopping and rolling restarts
+
+A stopping server drains: requests already running get up to `--drain-timeout` (default 60s) to
+finish before they are cancelled, and a cancelled request is answered with a retryable `529
+overloaded_error`, never a 499, so Claude Code retries it. Keep the service manager's stop timeout
+(systemd `TimeoutStopSec`, default 90s) above the drain timeout.
+
+For restarts no session notices, run two servers behind a TCP load balancer on the same box (for
+example Envoy with a `tcp_proxy` listener on the client-facing address) and pass `--balanced` to
+both. A rollout starts the idle server, points the balancer's new connections at it, then stops the
+old one. A `--balanced` server that is draining keeps serving the connections it already has, and
+each response closes its connection, so the client's next request opens a new connection, which the
+balancer sends to the new server. Give the two servers distinct `--instance` names so their metrics
+stay apart, and the same `--state-dir`: the CA and the server certificate are shared, and the
+certificate must name the address clients dial (listen on that address with another port).
+
 ## Logging
 
 claude-master has its own log, separate from the upstream SDK's output (which stays discarded: it can carry
@@ -522,6 +555,10 @@ claude-master account-key 11111111-2222-3333-4444-555555555555     # -> acct-666
 claude-master serve ... --account-label 11111111-2222-3333-4444-555555555555=colton --account-labels-file labels.txt
 ```
 
+`serve` looks at `--account-labels-file` every minute and, when the file has changed (replace it with a rename),
+loads it again and swaps the labels in: no restart. A file with a line that is not `ACCOUNT_UUID=NAME` is not
+loaded; the labels already in use stay and the log says why.
+
 **Dimensions.** `profile` (the subscription profile's own name, or `api-backup`), `client` (the connecting box's
 certificate name, `tunnel` on the open listener), **`client_account`** (the INCOMING user's Anthropic account: your
 label, else `acct-` and 8 hex of a hash; `unknown` when the request has none), `model`, `status_class`, `status`,
@@ -541,7 +578,7 @@ from its credential file name (those carry the account's email address).
 | `claude_master.inference.tokens` {profile, type}, `.tokens.by_client_account` {client_account, type}, `.tokens.by_client` {client, type} | counter | tokens each subscription (or `api-backup`) served, each user used and each box carried; `type` is `input`, `output`, `cache_read` or `cache_creation` (input excludes the cache fields, output includes thinking), from the usage Anthropic reports in each successful response |
 | `claude_master.inference.request_bytes`, `.response_bytes` {profile} | histogram | sizes |
 | `claude_master.quota.used_fraction`, `.resets_in_seconds`, `.rate_limited_for_seconds`, `.band` {profile} | gauge | each subscription's weekly allowance, when it resets, any cooldown, band (0 ok, 1 reserve, 2 exhausted, -1 unknown) |
-| `claude_master.quota.five_hour.used_fraction`, `.five_hour.resets_in_seconds` {profile} | gauge | each subscription's five-hour window from the usage poll (about once a minute, idle or not); 0 once the window has reset, and no countdown while no window is open |
+| `claude_master.quota.five_hour.used_fraction`, `.five_hour.resets_in_seconds` {profile} | gauge | each subscription's five-hour window from the usage poll (about every 3 minutes, idle or not); 0 once the window has reset, and no countdown while no window is open |
 | `claude_master.anthropic.ratelimit` {profile, window, measure} | gauge | EVERY `Anthropic-Ratelimit-*` header: windows `5h`, `7d`, `api`; measures `utilization`, `resets_in_seconds`, `remaining`, `limit` ... |
 | `claude_master.anthropic.ratelimit.state` {profile, window, measure, value} | counter | status words: `allowed`, `allowed_warning`, `rejected` |
 | `claude_master.routing.picks` {profile}, `.switches` {from, to, reason}, `.backup_requests`, `.pick_duration` | counter / histogram | routing and failover |
