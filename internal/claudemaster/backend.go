@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -857,6 +858,9 @@ func (s *backendSeriesSelector) boundUnavailableErrorLocked(ctx context.Context,
 	refusal := &backendRefusalError{kind: backendRefusalUnavailable, authID: boundID, model: model}
 	if status, failed := backendAttemptStatus(ctx, boundID, model); failed {
 		switch {
+		case status == http.StatusNotFound && backendUpstreamErrorFrom(ctx).notFoundWithoutAnthropicError():
+			// Not "model not found": Anthropic names that. Retried once already (backendRetryNotFound).
+			refusal.reason = fmt.Sprintf("subscription %s answered HTTP 404 with no Anthropic error for model %s, twice; that is not a model it cannot serve, and the pool moves a conversation only for a used-up weekly quota. Retry, or switch model with /model", name, model)
 		case status == http.StatusNotFound:
 			refusal.kind = backendRefusalNotFound
 			refusal.reason = fmt.Sprintf("subscription %s does not serve model %s (HTTP 404); the pool moves a conversation only for a used-up weekly quota, not for a model it cannot serve. Switch model with /model", name, model)
@@ -870,6 +874,26 @@ func (s *backendSeriesSelector) boundUnavailableErrorLocked(ctx context.Context,
 	refusal.reason = fmt.Sprintf("subscription %s is not available for model %s right now (cooling down after an upstream error, not out of weekly quota), so this conversation stays with it. Retry shortly, or switch model with /model", name, model)
 	return refusal
 }
+
+// backendUsagePollWhy says what a failed usage poll failed on: the fetch error without any URL
+// (bounded), or that the response carried no weekly figure. Before this every failure read
+// "usage request failed or carried no weekly figure", about every two minutes per profile.
+func backendUsagePollWhy(err error, known bool) string {
+	if err == nil {
+		if !known {
+			return "usage response carried no weekly figure"
+		}
+		return "usage request failed"
+	}
+	why := backendUsagePollURLs.ReplaceAllString(err.Error(), "<url>")
+	why = strings.Join(strings.Fields(why), " ")
+	if len(why) > 160 {
+		why = why[:160]
+	}
+	return "usage request failed: " + why
+}
+
+var backendUsagePollURLs = regexp.MustCompile(`https?://[^\s"]+`)
 
 func backendSeriesSessionIDs(opts coreexecutor.Options) (sessionID, parentSessionID string) {
 	sessionID = coreauth.CanonicalSessionID(opts.Headers, opts.OriginalRequest, opts.Metadata)
@@ -1309,7 +1333,7 @@ func loadBackendWeeklyQuotas(ctx context.Context, manager *coreauth.Manager, sel
 			quota, known, errQuota := FetchClaudeWeeklyQuota(ctx, auth, quotaRequest)
 			if errQuota != nil || !known || ctx.Err() != nil {
 				if ctx.Err() == nil {
-					selector.noteUsagePoll(authID, "usage request failed or carried no weekly figure")
+					selector.noteUsagePoll(authID, backendUsagePollWhy(errQuota, known))
 				}
 				return
 			}

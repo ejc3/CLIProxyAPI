@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -109,7 +110,7 @@ func noteBackendUpstreamErrorFor(ctx context.Context, authID, model string, err 
 	if status < 400 || status > 599 {
 		return
 	}
-	record := &backendUpstreamError{status: status, headers: upstream.ResponseHeaders(), body: append([]byte(nil), upstream.ResponseBody()...)}
+	record := backendUpstreamRecord(upstream)
 	logBackendUpstreamError(authID, model, record)
 	state := backendRequestAttempt(ctx)
 	if state == nil {
@@ -120,22 +121,131 @@ func noteBackendUpstreamErrorFor(ctx context.Context, authID, model string, err 
 	state.mu.Unlock()
 }
 
-// logBackendUpstreamError names what Anthropic answered, so a failure can be read from the
-// server log: the subscription's runtime id, the model, the status and the error's own type and
-// message (the first 200 characters). An error message is not a token, a body or a URL.
-func logBackendUpstreamError(authID, model string, upstream *backendUpstreamError) {
+func backendUpstreamRecord(upstream backendUpstreamResponseError) *backendUpstreamError {
+	return &backendUpstreamError{status: upstream.StatusCode(), headers: upstream.ResponseHeaders(), body: append([]byte(nil), upstream.ResponseBody()...)}
+}
+
+// anthropicError reads the body as Anthropic's own error object ({"type":"error","error":{...}});
+// ok is false for anything else: empty, HTML, plain text, another JSON shape.
+func (u *backendUpstreamError) anthropicError() (errorType, message string, ok bool) {
+	if u == nil {
+		return "", "", false
+	}
 	var body struct {
+		Type  string `json:"type"`
 		Error struct {
 			Type    string `json:"type"`
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	_ = json.Unmarshal(upstream.body, &body)
-	message := body.Error.Message
+	if err := json.Unmarshal(u.body, &body); err != nil || body.Error.Type == "" {
+		return "", "", false
+	}
+	return body.Error.Type, body.Error.Message, true
+}
+
+// notFoundWithoutAnthropicError: a 404 that is not Anthropic saying "model not found". Anthropic
+// names that (not_found_error, the model in the message); a 404 with no such body came from a
+// path or an intermediary, or was a transient. Observed 2026-10-09/10: 139 of them in 26 hours
+// across all three subscriptions and the API-key backup, on both models, while the same
+// subscriptions served the same models 2xx around them.
+func (u *backendUpstreamError) notFoundWithoutAnthropicError() bool {
+	if u == nil || u.status != http.StatusNotFound {
+		return false
+	}
+	_, _, anthropic := u.anthropicError()
+	return !anthropic
+}
+
+// logBackendUpstreamError names what Anthropic answered, so a failure can be read from the
+// server log: the subscription's runtime id, the model, the status and the error's own type and
+// message (the first 200 characters). An error message is not a token, a body or a URL. When the
+// body is NOT Anthropic's error object the line also carries what tells a wrong path or an
+// intermediary from Anthropic: the content type, request-id, cf-ray and server headers, and the
+// first 120 printable characters of the body. Before this every such line read "type= message="
+// and said nothing (2026-10-10).
+func logBackendUpstreamError(authID, model string, upstream *backendUpstreamError) {
+	lg().Warn("upstream error", backendUpstreamLogFields(authID, model, upstream)...)
+}
+
+func backendUpstreamLogFields(authID, model string, upstream *backendUpstreamError) []any {
+	errorType, message, anthropic := upstream.anthropicError()
 	if len(message) > 200 {
 		message = message[:200]
 	}
-	lg().Warn("upstream error", "auth", authID, "model", model, "status", upstream.status, "type", body.Error.Type, "message", message)
+	fields := []any{"auth", authID, "model", model, "status", upstream.status, "type", errorType, "message", message}
+	if anthropic {
+		return fields
+	}
+	h := upstream.headers
+	if h == nil {
+		h = http.Header{}
+	}
+	return append(fields,
+		"anthropic_error", false,
+		"content_type", h.Get("Content-Type"),
+		"request_id", h.Get("Request-Id"),
+		"cf_ray", h.Get("Cf-Ray"),
+		"server", h.Get("Server"),
+		"body_bytes", len(upstream.body),
+		"body", backendPrintablePrefix(upstream.body, 120),
+	)
+}
+
+func backendPrintablePrefix(body []byte, limit int) string {
+	var b strings.Builder
+	for _, r := range strings.ToValidUTF8(string(body), "") {
+		if b.Len() >= limit {
+			break
+		}
+		switch {
+		case r == '\n' || r == '\t' || r == '\r':
+			b.WriteByte(' ')
+		case unicode.IsPrint(r):
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// backendNotFoundRetryDelay is the pause before the one retry of a 404 with no Anthropic error.
+var backendNotFoundRetryDelay = 400 * time.Millisecond
+
+// backendRetryNotFound reports whether err is a 404 with no Anthropic error that this request
+// may retry once, on the same subscription, and spends that retry. Nothing has reached the
+// session at that point (the callers retry only before a stream exists), so the retry is
+// invisible except in the log. The first answer is logged as evidence either way.
+func backendRetryNotFound(ctx context.Context, authID, model string, err error) bool {
+	if err == nil {
+		return false
+	}
+	var upstream backendUpstreamResponseError
+	if !errors.As(err, &upstream) || upstream == nil {
+		return false
+	}
+	record := backendUpstreamRecord(upstream)
+	if !record.notFoundWithoutAnthropicError() {
+		return false
+	}
+	state := backendRequestAttempt(ctx)
+	if state == nil {
+		return false
+	}
+	state.mu.Lock()
+	spent := state.notFoundRetried
+	state.notFoundRetried = true
+	state.mu.Unlock()
+	if spent {
+		return false
+	}
+	logBackendUpstreamError(authID, model, record)
+	lg().Info("retrying a 404 with no Anthropic error once on the same subscription", "auth", authID, "model", model)
+	select {
+	case <-time.After(backendNotFoundRetryDelay):
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func backendUpstreamErrorFrom(ctx context.Context) *backendUpstreamError {
@@ -166,12 +276,18 @@ func withBackendUpstreamRecording(executor coreauth.ProviderExecutor) coreauth.P
 
 func (e *backendRecordingExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
 	resp, err := e.ProviderExecutor.Execute(ctx, auth, req, opts)
+	if backendRetryNotFound(ctx, backendAuthID(auth), req.Model, err) {
+		resp, err = e.ProviderExecutor.Execute(ctx, auth, req, opts)
+	}
 	noteBackendUpstreamErrorFor(ctx, backendAuthID(auth), req.Model, err)
 	return resp, err
 }
 
 func (e *backendRecordingExecutor) CountTokens(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
 	resp, err := e.ProviderExecutor.CountTokens(ctx, auth, req, opts)
+	if backendRetryNotFound(ctx, backendAuthID(auth), req.Model, err) {
+		resp, err = e.ProviderExecutor.CountTokens(ctx, auth, req, opts)
+	}
 	noteBackendUpstreamErrorFor(ctx, backendAuthID(auth), req.Model, err)
 	return resp, err
 }
@@ -179,6 +295,10 @@ func (e *backendRecordingExecutor) CountTokens(ctx context.Context, auth *coreau
 func (e *backendRecordingExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
 	result, err := e.ProviderExecutor.ExecuteStream(ctx, auth, req, opts)
 	authID, model := backendAuthID(auth), req.Model
+	// A 404 here is the response itself (no stream was opened), so the retry is safe.
+	if backendRetryNotFound(ctx, authID, model, err) {
+		result, err = e.ProviderExecutor.ExecuteStream(ctx, auth, req, opts)
+	}
 	noteBackendUpstreamErrorFor(ctx, authID, model, err)
 	if err != nil || result == nil || result.Chunks == nil {
 		return result, err

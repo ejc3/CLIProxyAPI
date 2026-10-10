@@ -22,6 +22,7 @@ type backendAttempt struct {
 	refusal          error                     // the selector's refusal in this request, for the client's error
 	refusalGeneric   bool                      // the refusal is a bare core error; a specific one replaces it
 	upstream         *backendUpstreamError     // the latest upstream error response of this request, exactly
+	notFoundRetried  bool                      // the one same-subscription retry of a 404 with no Anthropic error was spent
 	route            *backendRouteAttempt
 	pickedAt         time.Time // when an account was chosen: claude-master's own time ends here
 	count            bool
