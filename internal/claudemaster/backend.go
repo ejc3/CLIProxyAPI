@@ -74,12 +74,17 @@ type BackendSeriesOptions struct {
 	ModelMap     map[string]string
 	// SnapshotInterval is how often the quota snapshot is logged (default 5 minutes, negative: never).
 	SnapshotInterval time.Duration
+	// CheckBackupCredit turns on the periodic check that the API-key backup can pay (a token count with its key, at
+	// start and every 5 minutes; backend_backup_health.go). Off, a backup refused for credit is still marked
+	// unavailable by the passive check. The launcher turns it on; a backend built in a test makes no such call.
+	CheckBackupCredit bool
 }
 
 type backendRoutingOptions struct {
-	backupAPIKey     string
-	modelMap         map[string]string
-	snapshotInterval time.Duration
+	backupAPIKey      string
+	modelMap          map[string]string
+	snapshotInterval  time.Duration
+	checkBackupCredit bool
 }
 
 // Backend embeds inference, credential refresh, and subscription usage polling. It has no listener,
@@ -116,7 +121,7 @@ func NewBackendSeries(ctx context.Context, opts BackendSeriesOptions) (*Backend,
 	if opts.Credentials[0].Provider != "claude" {
 		return nil, errors.New("ordered inference currently supports Claude profiles only")
 	}
-	return newBackend(ctx, opts.Credentials, "", true, false, opts.QuotaRequest, backendRoutingOptions{backupAPIKey: opts.BackupAPIKey, modelMap: opts.ModelMap, snapshotInterval: opts.SnapshotInterval})
+	return newBackend(ctx, opts.Credentials, "", true, false, opts.QuotaRequest, backendRoutingOptions{backupAPIKey: opts.BackupAPIKey, checkBackupCredit: opts.CheckBackupCredit, modelMap: opts.ModelMap, snapshotInterval: opts.SnapshotInterval})
 }
 
 func newBackend(ctx context.Context, credentials []BackendCredential, modelName string, useRequestModel, pinSingle bool, quotaRequest ClaudeQuotaRequestFunc, routing backendRoutingOptions) (*Backend, error) {
@@ -286,7 +291,7 @@ func newBackend(ctx context.Context, credentials []BackendCredential, modelName 
 	if pollQuota {
 		backend.quotaPollDone = startBackendQuotaPolling(runCtx, manager, seriesSelector, subscriptionAuthIDs, quotaRequest, nil)
 	}
-	if seriesSelector != nil && backupAuthID != "" {
+	if seriesSelector != nil && backupAuthID != "" && routing.checkBackupCredit {
 		backend.backupDone = startBackupCreditChecks(runCtx, seriesSelector, newBackupCreditCheck(backupAPIKey, backendBackupCheckBaseURL, &http.Client{Timeout: 20 * time.Second}), nil)
 	}
 	if seriesSelector != nil {

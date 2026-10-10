@@ -205,7 +205,7 @@ func newInferenceBackend(ctx context.Context, profiles []Profile, opts LaunchOpt
 	for _, profile := range profiles {
 		credentials = append(credentials, BackendCredential{AuthDir: profile.AuthDir, Provider: profile.Provider, AuthID: profile.AuthID, Name: profile.Name})
 	}
-	return NewBackendSeries(ctx, BackendSeriesOptions{Credentials: credentials, BackupAPIKey: opts.BackupAPIKey, ModelMap: opts.ModelMap, SnapshotInterval: opts.SnapshotInterval})
+	return NewBackendSeries(ctx, BackendSeriesOptions{Credentials: credentials, BackupAPIKey: opts.BackupAPIKey, CheckBackupCredit: true, ModelMap: opts.ModelMap, SnapshotInterval: opts.SnapshotInterval})
 }
 
 // runNativeChild runs the native Claude with its prepared environment and returns its exit code.

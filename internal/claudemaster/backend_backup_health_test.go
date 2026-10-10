@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -136,5 +138,16 @@ func TestBackupChecksRunAtStartAndOnTicks(t *testing.T) {
 	<-done
 	if first != "unavailable" || second != "unavailable" || third != "available" {
 		t.Fatalf("states %q, %q, %q; want unavailable, unavailable (inconclusive kept it), available", first, second, third)
+	}
+}
+
+// The network check is opt-in: the launcher turns it on, and a backend built directly (every test) makes no call.
+func TestTheLauncherTurnsTheBackupCheckOn(t *testing.T) {
+	src, err := os.ReadFile("launcher.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), "BackupAPIKey: opts.BackupAPIKey, CheckBackupCredit: true") {
+		t.Fatal("the launcher does not turn the backup credit check on")
 	}
 }
