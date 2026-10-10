@@ -26,8 +26,11 @@ type ServeOptions struct {
 	OpenLoopback string
 	// SnapshotInterval is how often the quota and proxy summaries are logged (default 5 minutes).
 	SnapshotInterval time.Duration
-	StateDir         string    // the server's CA lives here (private, 0700)
-	Out              io.Writer // one status line; never a secret
+	// DrainTimeout is how long a stopping server lets running requests finish before it cancels
+	// them (default 60 seconds; systemd's default stop timeout is 90).
+	DrainTimeout time.Duration
+	StateDir     string    // the server's CA lives here (private, 0700)
+	Out          io.Writer // one status line; never a secret
 }
 
 // Serve runs the proxy for other boxes until ctx ends. The caller holds every profile lock.
@@ -49,7 +52,7 @@ func Serve(ctx context.Context, profiles []Profile, opts ServeOptions) error {
 	if launch.SnapshotInterval == 0 {
 		launch.SnapshotInterval = opts.SnapshotInterval
 	}
-	backend, err := newInferenceBackend(ctx, profiles, launch)
+	backend, err := newInferenceBackend(serveBackendLifetime(ctx), profiles, launch)
 	if err != nil {
 		return errors.New("cannot start the inference backend; check the profiles")
 	}
@@ -69,8 +72,22 @@ func Serve(ctx context.Context, profiles []Profile, opts ServeOptions) error {
 		}
 	}
 	<-ctx.Done()
+	drain := opts.DrainTimeout
+	if drain <= 0 {
+		drain = defaultDrainTimeout
+	}
+	proxy.Drain(drain)
 	return nil
 }
+
+const defaultDrainTimeout = 60 * time.Second
+
+// serveBackendLifetime keeps ctx's values but not its cancellation. Every request handler stops
+// when the backend's lifetime ends, and ctx ends on the signal that stops the server, so with ctx
+// itself a SIGTERM cancelled every running request before the drain began: on 2026-10-10 06:57 the
+// drain found 2 running and "waited 2ms". The backend now stops when Serve's deferred Close cancels
+// it, which runs after the drain.
+func serveBackendLifetime(ctx context.Context) context.Context { return context.WithoutCancel(ctx) }
 
 // serverNames are the addresses the server's certificate vouches for: the one it listens on, and
 // loopback, so a client can reach it through a local tunnel (an SSH or SSM port forward, a

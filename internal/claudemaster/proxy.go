@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
@@ -84,6 +85,9 @@ type Proxy struct {
 	control     *httputil.ReverseProxy
 	mu          sync.Mutex
 	closed      bool
+	draining    bool           // Drain has begun: new inference requests get a retryable 529
+	inflight    sync.WaitGroup // inference requests being served (the listeners are in wg, not here)
+	running     atomic.Int64   // the same count, for the log
 	conns       map[*proxyConn]struct{}
 	wg          sync.WaitGroup
 	closeOnce   sync.Once
@@ -215,6 +219,69 @@ func (p *Proxy) Snapshot() ProxyStats {
 		ControlRequests:   p.counters.controlRequests.Load(),
 		BlockedRequests:   p.counters.blockedRequests.Load(),
 		ActiveConnections: active,
+	}
+}
+
+// beginInference admits an inference request unless the proxy is draining or closed. The
+// count is taken under the lock that Drain sets draining under, so no request joins after
+// Drain has started waiting.
+func (p *Proxy) beginInference() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.draining || p.closed {
+		return false
+	}
+	p.inflight.Add(1)
+	p.running.Add(1)
+	return true
+}
+
+func (p *Proxy) isDraining() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.draining
+}
+
+func (p *Proxy) endInference() {
+	p.running.Add(-1)
+	p.inflight.Done()
+}
+
+// writeProxyRestarting answers an inference request that arrives while the server stops: what
+// Anthropic answers when it cannot take a request now (529 overloaded_error, x-should-retry), so
+// Claude Code backs off and retries, and finds the server again once it is back.
+func writeProxyRestarting(w http.ResponseWriter) {
+	w.Header().Set("X-Should-Retry", "true")
+	w.Header().Set("Connection", "close")
+	backendAnthropicError(w, 529, "overloaded_error", "claude-master is restarting; retry")
+}
+
+// Drain lets the requests already running finish before Close cancels them: new inference
+// requests are answered with a retryable 529 from now on, and Drain returns when the running
+// ones are done or timeout passes, whichever is first. Before this a restart cancelled every
+// running request at once and the session got a 499 it does not retry (2026-10-10 05:45).
+func (p *Proxy) Drain(timeout time.Duration) {
+	p.mu.Lock()
+	if p.closed || p.draining {
+		p.mu.Unlock()
+		return
+	}
+	p.draining = true
+	p.mu.Unlock()
+	running := p.running.Load()
+	if running == 0 {
+		lg().Info("proxy draining: no request running")
+		return
+	}
+	start := time.Now()
+	lg().Info("proxy draining", "running", running, "timeout", timeout)
+	done := make(chan struct{})
+	go func() { p.inflight.Wait(); close(done) }()
+	select {
+	case <-done:
+		lg().Info("proxy drained", "waited", time.Since(start).Round(time.Millisecond))
+	case <-time.After(timeout):
+		lg().Warn("proxy drain timed out; the requests still running are cancelled", "running", p.running.Load())
 	}
 }
 
@@ -445,6 +512,12 @@ func (p *Proxy) handleAPI(w http.ResponseWriter, r *http.Request) {
 		request.Header = coreexecutor.NativeClaudeProtocolHeaders(r.Header)
 		request.Header.Set("Content-Type", "application/json")
 		request = request.WithContext(coreexecutor.WithNativeClaudeProtocolHeaders(request.Context(), request.Header))
+		if !p.beginInference() {
+			p.counters.blockedRequests.Add(1)
+			writeProxyRestarting(w)
+			return
+		}
+		defer p.endInference()
 		p.counters.inferenceRequests.Add(1)
 		p.inference.ServeHTTP(w, request)
 		return

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
@@ -227,7 +229,7 @@ func newBackend(ctx context.Context, credentials []BackendCredential, modelName 
 	switch provider {
 	case "claude":
 		executor := newSharedClaudeExecutor(runtimeexecutor.NewClaudeExecutor(cfg), stores)
-		manager.RegisterExecutor(executor)
+		manager.RegisterExecutor(withBackendUpstreamRecording(executor))
 		if quotaRequest == nil {
 			quotaRequest = manager.HttpRequest // the default requester, resolved here so the cache wraps it
 		}
@@ -712,12 +714,15 @@ func (s *backendSeriesSelector) Pick(ctx context.Context, provider, model string
 	picked, err := s.pick(ctx, provider, model, opts, auths)
 	sessionID, _ := backendSeriesSessionIDs(opts)
 	s.noteSelection(sessionID, model, picked, err, time.Since(started))
+	if err != nil {
+		noteBackendRefusal(ctx, err)
+	}
 	return picked, err
 }
 
 func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string, opts coreexecutor.Options, auths []*coreauth.Auth) (*coreauth.Auth, error) {
 	if provider != s.provider && provider != "mixed" {
-		return nil, errors.New("inference provider differs from the ordered profiles")
+		return nil, backendRefuse(backendRefusalInternal, "inference provider differs from the ordered profiles")
 	}
 	sessionID, parentSessionID := backendSeriesSessionIDs(opts)
 	affinity := analyzeNativeRequestAffinity(opts.OriginalRequest)
@@ -730,7 +735,7 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stopped {
-		return nil, errors.New("ordered inference selector is stopped")
+		return nil, backendRefuse(backendRefusalUnavailable, "ordered inference selector is stopped")
 	}
 	s.initializeLocked()
 	// A paid API credential is not subscription capacity: do not use it to
@@ -757,7 +762,7 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 					return nil, errEpoch
 				}
 				if changed {
-					return nil, errors.New("the parent Claude conversation changed accounts; the first opaque child origin is ambiguous, so start the child with self-contained context")
+					return nil, backendRefuse(backendRefusalInvalid, "the parent Claude conversation changed accounts; the first opaque child origin is ambiguous, so start the child with self-contained context")
 				}
 			}
 		}
@@ -769,7 +774,7 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 				// Opaque API continuations still take the ordinary bound path below.
 				selected := s.preferredAuthLocked(auths, "")
 				if selected == nil {
-					return nil, errors.New("subscription capacity is unavailable; no quota handoff to the API-key backup is permitted")
+					return nil, s.quotaRefusalLocked("subscription capacity is unavailable; no quota handoff to the API-key backup is permitted")
 				}
 				picked, err := s.pickAuthLocked(ctx, model, opts, selected)
 				if err == nil && picked != nil {
@@ -786,6 +791,13 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 							return s.bindInheritedSessionLocked(ctx, sessionID, parentSessionID, picked)
 						}
 						return s.bindSessionLocked(ctx, sessionID, picked)
+					}
+					// The core refused the bound subscription (a model cooldown, an attempt that failed in
+					// this request): say which subscription, which model and why, in front of its error.
+					if err != nil && backendGenericRefusal(err) {
+						explained := s.boundUnavailableErrorLocked(ctx, boundID, backendAvailabilityModel(model, opts)).(*backendRefusalError)
+						explained.cause = err
+						err = explained
 					}
 					return picked, err
 				}
@@ -804,26 +816,26 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 				return s.bindSessionLocked(ctx, sessionID, picked)
 			} else {
 				if !switchable {
-					return nil, errors.New("the current Claude continuation account is unavailable; refusing to move opaque conversation state")
+					return nil, backendRefuse(backendRefusalInvalid, "the current Claude continuation account is unavailable; refusing to move opaque conversation state")
 				}
 				// Manager-side model cooldowns and request-scoped failures also
 				// remove an auth from this candidate slice. They must not rotate a
 				// subscription; only the weekly reserve policy may move clean work.
 				quota := s.currentQuotaLocked(boundID)
 				if backendAttemptFailed(ctx, boundID, backendAvailabilityModel(model, opts)) || (!strings.HasPrefix(boundID, "missing:") && !s.quotaBlockedLocked(boundID) && (!quota.known || quota.used < 1)) {
-					return nil, errors.New("the current Claude subscription is unavailable; no quota handoff is permitted")
+					return nil, s.boundUnavailableErrorLocked(ctx, boundID, backendAvailabilityModel(model, opts))
 				}
 			}
 			excludedAuthID = boundID
 		}
 	}
 	if opaque && excludedAuthID == "" {
-		return nil, errors.New("the Claude continuation origin is unknown; start a self-contained session before switching subscriptions")
+		return nil, backendRefuse(backendRefusalInvalid, "the Claude continuation origin is unknown; start a self-contained session before switching subscriptions")
 	}
 
 	selected := s.preferredAuthLocked(auths, excludedAuthID)
 	if selected == nil {
-		return nil, errors.New("ordered inference subscriptions are exhausted; no fallback is configured")
+		return nil, s.quotaRefusalLocked("ordered inference subscriptions are exhausted; no fallback is configured")
 	}
 	picked, err := s.pickAuthLocked(ctx, model, opts, selected)
 	if err != nil {
@@ -834,6 +846,60 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 	}
 	return picked, nil
 }
+
+// boundUnavailableErrorLocked explains why a conversation stays on a subscription that cannot
+// take it right now. Only a used-up weekly quota moves a conversation; an upstream error on the
+// bound subscription (a model it does not serve, a 5xx) does not, so the person can act on it:
+// the subscription's own name, the model, the status, and what to do.
+func (s *backendSeriesSelector) boundUnavailableErrorLocked(ctx context.Context, boundID, model string) error {
+	name := boundID
+	if n := s.names[boundID]; n != "" {
+		name = n
+	}
+	refusal := &backendRefusalError{kind: backendRefusalUnavailable, authID: boundID, model: model}
+	if status, failed := backendAttemptStatus(ctx, boundID, model); failed {
+		switch {
+		case status == http.StatusNotFound && backendUpstreamErrorFrom(ctx).notFoundWithoutAnthropicError():
+			// Not "model not found": Anthropic names that. Retried once already (backendRetryNotFound).
+			refusal.reason = fmt.Sprintf("subscription %s answered HTTP 404 with no Anthropic error for model %s, twice; that is not a model it cannot serve, and the pool moves a conversation only for a used-up weekly quota. Retry, or switch model with /model", name, model)
+		case status == http.StatusNotFound && !backendUpstreamErrorFrom(ctx).notFoundNamesModel(model):
+			// Anthropic's not_found_error, but about something in the request (a file, a container, a
+			// resource of another account), not the model. The session has Anthropic's own message.
+			refusal.kind = backendRefusalNotFound
+			refusal.reason = fmt.Sprintf("subscription %s: Anthropic answered 404 not_found_error for model %s about something in the request, not the model (the message is in the response and the server log); the pool moves a conversation only for a used-up weekly quota. Start a fresh session, or switch model with /model", name, model)
+		case status == http.StatusNotFound:
+			refusal.kind = backendRefusalNotFound
+			refusal.reason = fmt.Sprintf("subscription %s does not serve model %s (HTTP 404); the pool moves a conversation only for a used-up weekly quota, not for a model it cannot serve. Switch model with /model", name, model)
+		case status != 0:
+			refusal.reason = fmt.Sprintf("subscription %s answered HTTP %d for model %s; the pool moves a conversation only for a used-up weekly quota, not for an upstream error. Retry, or switch model with /model", name, status, model)
+		default:
+			refusal.reason = fmt.Sprintf("subscription %s failed this request for model %s; the pool moves a conversation only for a used-up weekly quota, not for an upstream error. Retry, or switch model with /model", name, model)
+		}
+		return refusal
+	}
+	refusal.reason = fmt.Sprintf("subscription %s is not available for model %s right now (cooling down after an upstream error, not out of weekly quota), so this conversation stays with it. Retry shortly, or switch model with /model", name, model)
+	return refusal
+}
+
+// backendUsagePollWhy says what a failed usage poll failed on: the fetch error without any URL
+// (bounded), or that the response carried no weekly figure. Before this every failure read
+// "usage request failed or carried no weekly figure", about every two minutes per profile.
+func backendUsagePollWhy(err error, known bool) string {
+	if err == nil {
+		if !known {
+			return "usage response carried no weekly figure"
+		}
+		return "usage request failed"
+	}
+	why := backendUsagePollURLs.ReplaceAllString(err.Error(), "<url>")
+	why = strings.Join(strings.Fields(why), " ")
+	if len(why) > 160 {
+		why = why[:160]
+	}
+	return "usage request failed: " + why
+}
+
+var backendUsagePollURLs = regexp.MustCompile(`https?://[^\s"]+`)
 
 func backendSeriesSessionIDs(opts coreexecutor.Options) (sessionID, parentSessionID string) {
 	sessionID = coreauth.CanonicalSessionID(opts.Headers, opts.OriginalRequest, opts.Metadata)
@@ -867,7 +933,7 @@ func (s *backendSeriesSelector) subscriptionsExhaustedLocked() bool {
 func (s *backendSeriesSelector) pickBackupLocked(ctx context.Context, model string, opts coreexecutor.Options, auths []*coreauth.Auth, sessionID string) (*coreauth.Auth, error) {
 	backup := backendSeriesAuthByID(auths, s.provider, s.backupAuthID)
 	if backup == nil {
-		return nil, errors.New("the final API-key backup is unavailable")
+		return nil, backendRefuse(backendRefusalUnavailable, "the final API-key backup is unavailable")
 	}
 	if s.limiter == nil {
 		s.limiter = newEvery(time.Minute)
@@ -922,7 +988,7 @@ func (s *backendSeriesSelector) pickAuthLocked(ctx context.Context, model string
 	if auth != nil && auth.ID != s.backupAuthID {
 		quota := s.currentQuotaLocked(auth.ID)
 		if s.quotaBlockedLocked(auth.ID) || (quota.known && quota.used >= 1) {
-			return nil, errors.New("the current Claude subscription quota is exhausted")
+			return nil, s.quotaRefusalLocked("the current Claude subscription quota is exhausted")
 		}
 	}
 	return (&coreauth.FillFirstSelector{}).Pick(ctx, s.provider, backendAvailabilityModel(model, opts), opts, []*coreauth.Auth{auth})
@@ -1193,6 +1259,15 @@ func setBackendResultPolicy(manager *coreauth.Manager, selector *backendSeriesSe
 				result.RouteModel = requestedModel
 			}
 		}
+		// The scheduler underneath is built for pools of API keys and benches a credential after a
+		// failure: twelve hours for a 404, thirty minutes for a 403. For three family subscriptions
+		// that is wrong: on 2026-10-09 two 404s that Anthropic did not repeat benched a subscription
+		// for Opus and, with another in its reserve band and the third out of quota, left the pool
+		// with no one to serve, twice in one day. Only two things move work off a subscription: its
+		// weekly quota is used up (a 429, which the selector tracks itself) or its login is dead (a
+		// 401, which the shared executor refreshes itself). Every other failure is this request's,
+		// relayed to the session exactly as Anthropic sent it, for the client to retry or not.
+		backendScopeFailureToRequest(&result)
 		recordBackendAttempt(ctx, result)
 		if result.Success {
 			commitBackendRouteAttempt(ctx, result.AuthID)
@@ -1212,6 +1287,19 @@ func setBackendResultPolicy(manager *coreauth.Manager, selector *backendSeriesSe
 		}
 		return result
 	}))
+}
+
+// backendScopeFailureToRequest marks a failed result as request-scoped unless it is a dead
+// login (401) or a used-up quota (429), so the scheduler does not bench the subscription.
+func backendScopeFailureToRequest(result *coreauth.Result) {
+	if result == nil || result.Success || result.Error == nil || result.Error.Code != "" {
+		return
+	}
+	switch result.Error.HTTPStatus {
+	case http.StatusUnauthorized, http.StatusTooManyRequests:
+		return
+	}
+	result.Error.Code = coreauth.ErrorCodeRequestScoped
 }
 
 func setBackendSeriesResultPolicy(manager *coreauth.Manager, selector *backendSeriesSelector) {
@@ -1251,7 +1339,7 @@ func loadBackendWeeklyQuotas(ctx context.Context, manager *coreauth.Manager, sel
 			quota, known, errQuota := FetchClaudeWeeklyQuota(ctx, auth, quotaRequest)
 			if errQuota != nil || !known || ctx.Err() != nil {
 				if ctx.Err() == nil {
-					selector.noteUsagePoll(authID, "usage request failed or carried no weekly figure")
+					selector.noteUsagePoll(authID, backendUsagePollWhy(errQuota, known))
 				}
 				return
 			}
@@ -1467,13 +1555,13 @@ func newBackendHandler(lifetime context.Context, opts BackendOptions, base *hand
 				if errMsg == nil {
 					writeBackendNativeSuccessStatus(ctx, c.Writer)
 				}
-				writeBackendNativeResult(c.Writer, response.Body, errMsg)
+				writeBackendNativeResult(ctx, c.Writer, response.Body, errMsg)
 				return
 			}
 			payload, headers, errMsg := base.ExecuteCountWithAuthManager(ctx, "claude", model, raw, "")
 			observeBackendError(ctx, errMsg)
 			writeBackendProtocolHeaders(c.Writer.Header(), headers)
-			writeBackendResult(c.Writer, payload, errMsg)
+			writeBackendResult(ctx, c.Writer, payload, errMsg)
 			return
 		}
 		var envelope struct {
@@ -1492,13 +1580,13 @@ func newBackendHandler(lifetime context.Context, opts BackendOptions, base *hand
 			if errMsg == nil {
 				writeBackendNativeSuccessStatus(ctx, c.Writer)
 			}
-			writeBackendNativeResult(c.Writer, response.Body, errMsg)
+			writeBackendNativeResult(ctx, c.Writer, response.Body, errMsg)
 			return
 		}
 		payload, headers, errMsg := base.ExecuteWithAuthManager(ctx, "claude", model, raw, "")
 		observeBackendError(ctx, errMsg)
 		writeBackendProtocolHeaders(c.Writer.Header(), headers)
-		writeBackendResult(c.Writer, payload, errMsg)
+		writeBackendResult(ctx, c.Writer, payload, errMsg)
 	}
 	router.POST("/v1/messages", dispatch)
 	router.POST("/v1/messages/count_tokens", dispatch)
@@ -1639,9 +1727,9 @@ func validateBackendMappedModel(raw []byte) error {
 	return nil
 }
 
-func writeBackendResult(w http.ResponseWriter, payload []byte, errMsg *interfaces.ErrorMessage) {
+func writeBackendResult(ctx context.Context, w http.ResponseWriter, payload []byte, errMsg *interfaces.ErrorMessage) {
 	if errMsg != nil {
-		writeBackendUpstreamError(w, errMsg)
+		writeBackendUpstreamError(ctx, w, errMsg)
 		return
 	}
 	if len(payload) >= 2 && payload[0] == 0x1f && payload[1] == 0x8b {
@@ -1664,9 +1752,9 @@ func writeBackendResult(w http.ResponseWriter, payload []byte, errMsg *interface
 	_, _ = w.Write(payload)
 }
 
-func writeBackendNativeResult(w http.ResponseWriter, payload []byte, errMsg *interfaces.ErrorMessage) {
+func writeBackendNativeResult(ctx context.Context, w http.ResponseWriter, payload []byte, errMsg *interfaces.ErrorMessage) {
 	if errMsg != nil {
-		writeBackendNativeUpstreamError(w, errMsg)
+		writeBackendNativeUpstreamError(ctx, w, errMsg)
 		return
 	}
 	_, _ = w.Write(payload)
@@ -1705,7 +1793,7 @@ func streamBackendResponse(ctx context.Context, w http.ResponseWriter, base *han
 			}
 			observeBackendError(ctx, errMsg)
 			if !started {
-				writeBackendUpstreamError(w, errMsg)
+				writeBackendUpstreamError(ctx, w, errMsg)
 			}
 			return
 		case chunk, open := <-data:
@@ -1742,7 +1830,7 @@ func streamBackendProtocolResponse(ctx context.Context, w http.ResponseWriter, f
 	stream, errMsg := base.ExecuteProtocolStreamWithAuthManager(ctx, backendProtocolRequest(model, raw, true))
 	if errMsg != nil {
 		observeBackendError(ctx, errMsg)
-		writeBackendNativeUpstreamError(w, errMsg)
+		writeBackendNativeUpstreamError(ctx, w, errMsg)
 		return
 	}
 	started := false
@@ -1786,7 +1874,7 @@ func streamBackendProtocolResponse(ctx context.Context, w http.ResponseWriter, f
 				streamErr := &interfaces.ErrorMessage{StatusCode: chunk.Err.StatusCode, Error: chunk.Err, Addon: chunk.Err.Headers}
 				observeBackendError(ctx, streamErr)
 				if !started {
-					writeBackendNativeUpstreamError(w, streamErr)
+					writeBackendNativeUpstreamError(ctx, w, streamErr)
 				}
 				return
 			}
@@ -1794,7 +1882,7 @@ func streamBackendProtocolResponse(ctx context.Context, w http.ResponseWriter, f
 	}
 }
 
-func writeBackendUpstreamError(w http.ResponseWriter, errMsg *interfaces.ErrorMessage) {
+func writeBackendUpstreamError(ctx context.Context, w http.ResponseWriter, errMsg *interfaces.ErrorMessage) {
 	if status, headers, body, ok := backendDirectErrorResponse(errMsg); ok {
 		writeBackendProtocolHeaders(w.Header(), headers)
 		w.WriteHeader(status)
@@ -1802,7 +1890,11 @@ func writeBackendUpstreamError(w http.ResponseWriter, errMsg *interfaces.ErrorMe
 		return
 	}
 	if errMsg == nil {
-		backendError(w, http.StatusBadGateway, "Configured inference failed; no fallback to the native master was attempted")
+		writeBackendFailure(ctx, w, http.StatusBadGateway, writeBackendProtocolHeaders)
+		return
+	}
+	if errMsg.StatusCode == clienterror.StatusClientClosedRequest {
+		writeBackendCancelled(w)
 		return
 	}
 	writeBackendProtocolHeaders(w.Header(), errMsg.Addon)
@@ -1810,10 +1902,10 @@ func writeBackendUpstreamError(w http.ResponseWriter, errMsg *interfaces.ErrorMe
 	if status < 400 || status > 599 {
 		status = http.StatusBadGateway
 	}
-	backendError(w, status, "Configured inference failed; no fallback to the native master was attempted")
+	writeBackendFailure(ctx, w, status, writeBackendProtocolHeaders)
 }
 
-func writeBackendNativeUpstreamError(w http.ResponseWriter, errMsg *interfaces.ErrorMessage) {
+func writeBackendNativeUpstreamError(ctx context.Context, w http.ResponseWriter, errMsg *interfaces.ErrorMessage) {
 	if status, headers, body, ok := backendDirectErrorResponse(errMsg); ok {
 		writeBackendNativeHeaders(w.Header(), headers)
 		w.WriteHeader(status)
@@ -1821,7 +1913,11 @@ func writeBackendNativeUpstreamError(w http.ResponseWriter, errMsg *interfaces.E
 		return
 	}
 	if errMsg == nil {
-		backendError(w, http.StatusBadGateway, "Configured inference failed; no fallback to the native master was attempted")
+		writeBackendFailure(ctx, w, http.StatusBadGateway, writeBackendNativeHeaders)
+		return
+	}
+	if errMsg.StatusCode == clienterror.StatusClientClosedRequest {
+		writeBackendCancelled(w)
 		return
 	}
 	writeBackendNativeHeaders(w.Header(), errMsg.Addon)
@@ -1829,7 +1925,7 @@ func writeBackendNativeUpstreamError(w http.ResponseWriter, errMsg *interfaces.E
 	if status < 400 || status > 599 {
 		status = http.StatusBadGateway
 	}
-	backendError(w, status, "Configured inference failed; no fallback to the native master was attempted")
+	writeBackendFailure(ctx, w, status, writeBackendNativeHeaders)
 }
 
 func backendDirectErrorResponse(errMsg *interfaces.ErrorMessage) (int, http.Header, []byte, bool) {

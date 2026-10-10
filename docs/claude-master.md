@@ -250,9 +250,18 @@ provider-side state, including:
 
 - container or uploaded/file identifiers;
 - server-tool continuation state;
-- encrypted content or redacted thinking;
-- signed thinking or signed compaction blocks; or
+- encrypted server-tool content; or
+- signed compaction blocks; or
 - a payload that cannot be classified as valid JSON.
+
+Signed `thinking` and `redacted_thinking` blocks do NOT pin a conversation to its account.
+Anthropic's preserved-thinking rules say so and it was checked on this pool's own subscriptions on
+2026-10-09 with the `thinking-binding-controls-2026-08-01` beta: a Claude Opus 5.5 block minted on
+one subscription replays on another with `input_transformations: []`, even with
+`prefix_mismatch_behavior: "error"`; a Claude Sonnet 5.5 block is dropped by the API
+(`thinking_dropped`, reason `end_user_binding_mismatch`) and the request still succeeds. The proxy
+never strips thinking itself: the API already drops what the target model or account cannot read,
+and a client-side strip would be an edit that invalidates every later block.
 
 Bindings use Claude Code's conversation and agent hierarchy. A subagent can receive a
 separate account for self-contained work; if its first request carries opaque state, it
@@ -262,6 +271,26 @@ could predate the switch. The proxy refuses that request; a self-contained child
 can still start normally, and already-bound children retain their own origins.
 This lets independent fanout use separate subscriptions without guessing the
 owner of account-bound continuation data.
+
+Errors reach the session exactly as Anthropic sends them, so the client reacts as it would
+to Anthropic. An upstream error response is relayed byte for byte (its status, its body, and
+the headers the client acts on: `request-id`, `retry-after`, `x-should-retry`,
+`anthropic-ratelimit-*`), including when the scheduler retried after it and the pool then
+refused: the last upstream error of the request is what the session gets. A failure that is
+not a dead login (401) or a used-up quota (429) never benches the subscription: the scheduler
+underneath would otherwise keep a subscription off a model for twelve hours after one 404,
+and two 404s Anthropic did not repeat took the whole pool down twice on 2026-10-09. The next
+request of the same conversation goes to the same subscription; the server log records each
+upstream error's type and message. Only a refusal with no upstream error behind it is synthesized, in Anthropic's error shape, with the type and
+status the client would get from Anthropic for that situation: every subscription out of
+weekly quota is a 429 `rate_limit_error` with Anthropic's rate-limit text, the unified
+rate-limit headers and a `retry-after` pointing at the earliest reset; opaque state the pool
+will not move is a 400 `invalid_request_error`; a bound subscription that does not serve the
+model is a 404 `not_found_error`; a cooldown or an active handoff is a 529
+`overloaded_error`; the pool's own fault is a 500 `api_error`. The reason is in the message
+(`claude-master: ...`) or, for the 429, in the `Claude-Master-Reason` header; it is
+claude-master's text (a profile name, a model, a status), never upstream text. Only a used-up
+weekly quota moves a conversation; an upstream error on the bound subscription keeps it there.
 
 An account handoff is deferred while another generation for the same session is
 active. Clients must preserve chronological history under a session ID; replaying
@@ -302,7 +331,10 @@ later request.
   login and provider settings `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh`, `forceLoginMethod`
   and `forceLoginOrgUUID`, or an `env` block that sets a provider variable (`ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`,
   `CLAUDE_CODE_USE_BEDROCK`, ...), a proxy variable (`HTTPS_PROXY`, `NO_PROXY`, ...) or `NODE_EXTRA_CA_CERTS`. The error
-  names the setting, never its value. A value that cannot be read as a settings object is refused, because its effect is
+  names the setting, never its value. `NODE_OPTIONS` is refused too, in settings and in the environment, with one
+  allowance: a value made only of V8 heap-size flags (`--max-old-space-size=N`, `--max-semi-space-size=N`) is kept, because
+  a project commonly caps its builds' memory that way and those flags cannot load code, change TLS trust or route traffic;
+  anything else in it (`--require`, `--import`, `--use-openssl-ca`, ...) stays refused. A value that cannot be read as a settings object is refused, because its effect is
   unknown. This is a guard against accidental or wrapper-injected redirection, not a defence against a user who can
   already run Claude directly.
 - The local proxy is an HTTPS listener that requires a client certificate; there is no password.
