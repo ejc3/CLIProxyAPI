@@ -277,6 +277,14 @@ func (p *Proxy) Drain(timeout time.Duration) {
 	p.draining = true
 	balanced := p.balanced
 	p.mu.Unlock()
+	if balanced {
+		// Close every idle keep-alive connection now, and every busy one after its response: a client's next
+		// request then opens a new connection, which the balancer sends to the server taking over. Without this
+		// each client's first request after a rollout still landed here, on the old configuration: on 2026-10-10
+		// the old server, which did not know a subscription the new one had just added, sent 30 requests to an
+		// API-key backup with no credit while the new server had capacity.
+		p.inner.SetKeepAlivesEnabled(false)
+	}
 	running := p.running.Load()
 	if running == 0 && !balanced {
 		lg().Info("proxy draining: no request running")

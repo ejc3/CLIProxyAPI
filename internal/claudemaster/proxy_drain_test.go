@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -197,5 +198,40 @@ func TestBalancedDrainServesExistingConnectionsAndClosesThem(t *testing.T) {
 	case <-drained:
 	case <-time.After(3 * time.Second):
 		t.Fatal("Drain did not return after the running request finished")
+	}
+}
+
+// A balanced drain closes idle keep-alive connections at once, so a client's next request cannot land on the
+// old server: it opens a new connection, which the balancer sends to the new one.
+func TestBalancedDrainClosesIdleConnectionsAtOnce(t *testing.T) {
+	proxy, transport := startDrainServer(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "served") })
+	proxy.setBalanced(true)
+	var conns atomic.Int32
+	dial := transport.DialContext
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conns.Add(1)
+		return dial(ctx, network, addr)
+	}
+	if status, _, body, err := drainPost(transport); err != nil || status != 200 || body != "served" {
+		t.Fatalf("first request: %d %q %v", status, body, err)
+	}
+	if status, _, _, err := drainPost(transport); err != nil || status != 200 || conns.Load() != 1 {
+		t.Fatalf("second request before the drain should reuse the idle connection: %d %v conns=%d", status, err, conns.Load())
+	}
+	go proxy.Drain(5 * time.Second)
+	deadline := time.Now().Add(2 * time.Second)
+	for !proxy.isDraining() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // the server closes idle connections; the client notices on its next use
+	status, _, body, err := drainPost(transport)
+	if err != nil || status != 200 || body != "served" {
+		t.Fatalf("request after the drain started: %d %q %v", status, body, err)
+	}
+	if conns.Load() != 2 {
+		t.Fatalf("the request after the drain reused the old idle connection (connections dialled: %d)", conns.Load())
 	}
 }
