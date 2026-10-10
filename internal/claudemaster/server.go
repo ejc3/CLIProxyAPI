@@ -26,8 +26,11 @@ type ServeOptions struct {
 	OpenLoopback string
 	// SnapshotInterval is how often the quota and proxy summaries are logged (default 5 minutes).
 	SnapshotInterval time.Duration
-	StateDir         string    // the server's CA lives here (private, 0700)
-	Out              io.Writer // one status line; never a secret
+	// DrainTimeout is how long a stopping server lets running requests finish before it cancels
+	// them (default 60 seconds; systemd's default stop timeout is 90).
+	DrainTimeout time.Duration
+	StateDir     string    // the server's CA lives here (private, 0700)
+	Out          io.Writer // one status line; never a secret
 }
 
 // Serve runs the proxy for other boxes until ctx ends. The caller holds every profile lock.
@@ -69,8 +72,15 @@ func Serve(ctx context.Context, profiles []Profile, opts ServeOptions) error {
 		}
 	}
 	<-ctx.Done()
+	drain := opts.DrainTimeout
+	if drain <= 0 {
+		drain = defaultDrainTimeout
+	}
+	proxy.Drain(drain)
 	return nil
 }
+
+const defaultDrainTimeout = 60 * time.Second
 
 // serverNames are the addresses the server's certificate vouches for: the one it listens on, and
 // loopback, so a client can reach it through a local tunnel (an SSH or SSM port forward, a

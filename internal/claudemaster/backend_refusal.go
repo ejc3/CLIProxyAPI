@@ -492,6 +492,15 @@ func writeBackendQuotaHeaders(dst http.Header, resetAt time.Time) {
 	}
 }
 
+// writeBackendCancelled answers a request whose context was cancelled (the core reports 499).
+// Either the client has gone, and nobody reads this, or the server cancelled it while stopping,
+// and the session must retry: Anthropic's 529 overloaded_error with x-should-retry, never a 499
+// with "Configured inference failed", which Claude Code does not retry (seen 2026-10-10 05:45).
+func writeBackendCancelled(w http.ResponseWriter) {
+	w.Header().Set("X-Should-Retry", "true")
+	backendAnthropicError(w, 529, "overloaded_error", "claude-master: the request was cancelled on the server (a restart); retry")
+}
+
 func backendAnthropicError(w http.ResponseWriter, status int, errorType, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

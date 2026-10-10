@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
@@ -1892,6 +1893,10 @@ func writeBackendUpstreamError(ctx context.Context, w http.ResponseWriter, errMs
 		writeBackendFailure(ctx, w, http.StatusBadGateway, writeBackendProtocolHeaders)
 		return
 	}
+	if errMsg.StatusCode == clienterror.StatusClientClosedRequest {
+		writeBackendCancelled(w)
+		return
+	}
 	writeBackendProtocolHeaders(w.Header(), errMsg.Addon)
 	status := errMsg.StatusCode
 	if status < 400 || status > 599 {
@@ -1909,6 +1914,10 @@ func writeBackendNativeUpstreamError(ctx context.Context, w http.ResponseWriter,
 	}
 	if errMsg == nil {
 		writeBackendFailure(ctx, w, http.StatusBadGateway, writeBackendNativeHeaders)
+		return
+	}
+	if errMsg.StatusCode == clienterror.StatusClientClosedRequest {
+		writeBackendCancelled(w)
 		return
 	}
 	writeBackendNativeHeaders(w.Header(), errMsg.Addon)
