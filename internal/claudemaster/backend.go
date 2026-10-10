@@ -717,6 +717,7 @@ type backendSeriesSelector struct {
 	prepareIdentity   func(context.Context, *coreauth.Auth) (*coreauth.Auth, error)
 	activeRoutes      map[string]map[string]int
 	now               func() time.Time
+	usagePollAfter    map[string]time.Time // an account's usage poll waits until then after a 429
 	stopped           bool
 
 	names       map[string]string // runtime auth id -> the profile's own name, for logs and metrics
@@ -1361,6 +1362,10 @@ func loadBackendWeeklyQuotas(ctx context.Context, manager *coreauth.Manager, sel
 				auth = refreshed
 			}
 			payload, errFetch := fetchClaudeUsage(ctx, auth, quotaRequest)
+			var statusErr *claudeUsageStatusError
+			if errors.As(errFetch, &statusErr) && statusErr.status == http.StatusTooManyRequests {
+				selector.deferUsagePoll(authID, statusErr.retryAfter)
+			}
 			if errFetch == nil {
 				if fiveHour, okFiveHour, errFiveHour := ParseClaudeFiveHourQuota(payload); errFiveHour == nil && okFiveHour {
 					selector.observeFiveHourQuota(authID, fiveHour)

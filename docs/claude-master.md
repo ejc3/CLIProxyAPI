@@ -216,8 +216,13 @@ it does not turn a five-hour rejection into exhausted weekly usage. Request-scop
 model-scoped, authentication, validation, and transport failures do not drain or rotate
 the account.
 
-After startup, the usage API is polled every 60 seconds for all subscription profiles,
-never the API-key backup. This retries failed startup reads and picks up weekly resets,
+After startup, the usage API is polled about every 3 minutes (each round jittered 20% either
+way) for all subscription profiles, never the API-key backup. The profiles do not ask at once:
+each waits its own fixed phase after the round starts, spread across the first half of the
+interval. Anthropic limits this endpoint per account (polled every minute, every other request
+was refused with 429), so a 429 holds that profile's poll back for its `Retry-After`, or one
+more interval without one, at most 15 minutes. Busy profiles are also updated from every
+inference response's rate-limit headers; the poll keeps idle ones and reset times current. This retries failed startup reads and picks up weekly resets,
 quota grants, and usage from other processes. Accounts are queried independently, with
 at most one usage request in flight per account, so a stalled account does not stop
 the others from updating. Failed or unknown responses keep the last known quota.
@@ -330,8 +335,9 @@ later request.
   - a 401 adopts a newer saved credential, or rotates under the lock (at most once per 30 seconds
     per launcher), then retries once before any response is exposed;
   - a save never writes older tokens over newer ones;
-  - the usage poll is served from a short-lived cache file (`auth.usage`, 45 s) when another
-    launcher fetched it, so N launchers make about one usage request a minute per account.
+  - the usage poll is served from a short-lived cache file (`auth.usage`, 2 minutes, shorter
+    than the shortest jittered interval) when another launcher fetched it, so N launchers make about
+    one usage request per interval per account.
   The kernel releases the lock when its holder dies, so a crashed launcher cannot wedge the rest.
   Conversation routing records are one file per session and need no coordination. A Codex profile
   keeps the old rule of one launcher at a time.
@@ -568,7 +574,7 @@ from its credential file name (those carry the account's email address).
 | `claude_master.inference.tokens` {profile, type}, `.tokens.by_client_account` {client_account, type}, `.tokens.by_client` {client, type} | counter | tokens each subscription (or `api-backup`) served, each user used and each box carried; `type` is `input`, `output`, `cache_read` or `cache_creation` (input excludes the cache fields, output includes thinking), from the usage Anthropic reports in each successful response |
 | `claude_master.inference.request_bytes`, `.response_bytes` {profile} | histogram | sizes |
 | `claude_master.quota.used_fraction`, `.resets_in_seconds`, `.rate_limited_for_seconds`, `.band` {profile} | gauge | each subscription's weekly allowance, when it resets, any cooldown, band (0 ok, 1 reserve, 2 exhausted, -1 unknown) |
-| `claude_master.quota.five_hour.used_fraction`, `.five_hour.resets_in_seconds` {profile} | gauge | each subscription's five-hour window from the usage poll (about once a minute, idle or not); 0 once the window has reset, and no countdown while no window is open |
+| `claude_master.quota.five_hour.used_fraction`, `.five_hour.resets_in_seconds` {profile} | gauge | each subscription's five-hour window from the usage poll (about every 3 minutes, idle or not); 0 once the window has reset, and no countdown while no window is open |
 | `claude_master.anthropic.ratelimit` {profile, window, measure} | gauge | EVERY `Anthropic-Ratelimit-*` header: windows `5h`, `7d`, `api`; measures `utilization`, `resets_in_seconds`, `remaining`, `limit` ... |
 | `claude_master.anthropic.ratelimit.state` {profile, window, measure, value} | counter | status words: `allowed`, `allowed_warning`, `rejected` |
 | `claude_master.routing.picks` {profile}, `.switches` {from, to, reason}, `.backup_requests`, `.pick_duration` | counter / histogram | routing and failover |

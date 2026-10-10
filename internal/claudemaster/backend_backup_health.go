@@ -121,9 +121,7 @@ func startBackupCreditChecks(ctx context.Context, s *backendSeriesSelector, chec
 		}
 		run()
 		if ticks == nil {
-			ticker := time.NewTicker(backendBackupCheckInterval)
-			defer ticker.Stop()
-			ticks = ticker.C
+			ticks = jitteredTicks(ctx, backendBackupCheckInterval, backendPollJitterFraction)
 		}
 		for {
 			select {
