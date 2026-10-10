@@ -725,6 +725,11 @@ func proxyControlPath(method, path string) bool {
 	if path == "/api/web/domain_info" {
 		return method == http.MethodGet
 	}
+	// Claude Code checks it can reach Anthropic before an interactive session starts (2.1.296 aborts startup
+	// with "Unable to connect to Anthropic services" on a 403 here). It carries no credential.
+	if path == "/api/hello" {
+		return method == http.MethodGet || method == http.MethodHead
+	}
 	if strings.HasPrefix(path, "/v1/code/runners/self-hosted/") {
 		return method == http.MethodGet || method == http.MethodPost || method == http.MethodDelete
 	}
