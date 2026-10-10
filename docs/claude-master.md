@@ -36,14 +36,13 @@ parse/rebuild, or synthesize SSE events. HTTP
 hop-by-hop fields and connection framing are necessarily regenerated for the local
 connection.
 
-Known control and Remote Control routes continue to Anthropic with the master login, and so does
-any other route of Claude Code's own control plane (`/v1/code/...`), claude.ai's `/api/...` and the
-MCP registry: a new Claude Code release that calls a new endpoint keeps working (each new route shape
-is logged once, `relayed an unlisted Anthropic route`). A route that may spend tokens never runs on the
-master account: the rest of the public API (`/v1` outside `/v1/code`, any other version) and any path
-naming messages, completions, generation, batches or agent proxying fail closed (logged once, `blocked
-an unlisted route that may spend tokens`). Remote Control's environment routes keep their exact rules,
-and an ambiguous or encoded path is refused before any of this. There is no Bedrock or master-account inference fallback. An explicitly
+Inference (`POST /v1/messages`, `POST /v1/messages/count_tokens`) goes to the pool. Every other
+Anthropic route goes to Anthropic unchanged, on the session's own login, exactly as Claude Code
+would send it without claude-master: compatibility comes first, so a new Claude Code release that
+calls a new endpoint keeps working. claude-master adds no credential to these requests, so relaying
+them grants nothing. A route not in the reviewed list (`proxyControlPath`) is logged once per shape
+(`relayed an unlisted Anthropic route`, method and path with ids replaced). Only an ambiguous or
+encoded path, or the pool's own routes with the wrong method, are refused. There is no Bedrock or master-account inference fallback. An explicitly
 provided Anthropic API key can serve as the final backup after subscription quota is
 exhausted; without one, inference stays subscription-only.
 

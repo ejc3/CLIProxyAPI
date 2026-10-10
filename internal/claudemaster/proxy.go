@@ -551,86 +551,37 @@ func (p *Proxy) handleAPI(w http.ResponseWriter, r *http.Request) {
 		p.inference.ServeHTTP(w, request)
 		return
 	}
-	if path == "/v1/sessions" || strings.HasPrefix(path, "/v1/sessions/") {
-		if !proxyLegacySessionPath(r.Method, path) || !proxyLegacySessionRequest(r) {
-			p.counters.blockedRequests.Add(1)
-			http.Error(w, "unrecognized legacy Remote Control request; request blocked", http.StatusForbidden)
-			return
-		}
-		p.counters.controlRequests.Add(1)
-		observeControl(r)
-		p.control.ServeHTTP(w, r)
-		return
-	}
-	// Remote Control's environment routes keep their audited exact rules: an unknown one there fails closed.
-	if path == "/v1/environments" || strings.HasPrefix(path, "/v1/environments/") {
-		if !proxyControlPath(r.Method, path) {
-			p.counters.blockedRequests.Add(1)
-			http.Error(w, "unrecognized Remote Control environment request; request blocked", http.StatusForbidden)
-			return
-		}
-		p.counters.controlRequests.Add(1)
-		observeControl(r)
-		p.control.ServeHTTP(w, r)
-		return
-	}
-	if !proxyControlPath(r.Method, path) {
-		// Never send a route that may spend tokens to the session's own account: that would spend the person's
-		// own allowance instead of the pool's.
-		if proxyInferenceLike(path) {
-			p.counters.blockedRequests.Add(1)
-			p.noteRoute(false, r.Method, path)
-			http.Error(w, "unlisted route that may spend tokens; request blocked", http.StatusForbidden)
-			return
-		}
-		// Any other Anthropic route goes through on the session's own login, as a known control route does, so a
-		// new Claude Code release that calls a new endpoint keeps working (2.1.296's /api/hello was refused and
-		// stopped every interactive start, 2026-10-10). The first request of each route shape is logged.
-		p.noteRoute(true, r.Method, path)
+	// Everything else goes to Anthropic unchanged, on the session's own login: exactly what Claude Code does
+	// without claude-master. claude-master adds no credential to these requests, so relaying them grants
+	// nothing; refusing them only broke sessions (WebFetch's domain check, 2.1.296's /api/hello, claude.ai MCP
+	// connectors, telemetry). Compatibility comes first. A route not in the reviewed list is logged once per
+	// shape, for visibility only.
+	if !proxyListedRoute(r, path) {
+		p.noteRoute(r.Method, path)
 	}
 	p.counters.controlRequests.Add(1)
 	observeControl(r)
 	p.control.ServeHTTP(w, r)
 }
 
-// proxyInferenceLike: an unlisted route that may spend tokens, so it must not run on the session's own
-// account. Unlisted routes pass only in Claude Code's own control plane (/v1/code/...), claude.ai's /api/...
-// routes and the MCP registry, and even there not when the path names inference (messages, completions,
-// generation, batches, agent proxying). The rest of the public API surface (/v1 outside /v1/code, any other
-// version) may bill and stays closed. Remote Control's environment routes never reach here: they keep their
-// exact rules.
-func proxyInferenceLike(path string) bool {
-	lower := strings.ToLower(path)
-	for _, word := range []string{"messages", "complet", "inference", "generat", "batches", "agent-proxy"} {
-		if strings.Contains(lower, word) {
-			return true
-		}
+// proxyListedRoute: routes reviewed as Claude Code control traffic (proxyControlPath, the legacy Remote
+// Control sessions). Only the "unlisted route" log line depends on it; every route is relayed.
+func proxyListedRoute(r *http.Request, path string) bool {
+	if path == "/v1/sessions" || strings.HasPrefix(path, "/v1/sessions/") {
+		return proxyLegacySessionPath(r.Method, path) && proxyLegacySessionRequest(r)
 	}
-	for _, open := range []string{"/v1/code/", "/api/", "/mcp-registry/"} {
-		if strings.HasPrefix(path, open) {
-			return false
-		}
-	}
-	return true
+	return proxyControlPath(r.Method, path)
 }
 
-// noteRoute logs the first request of each route shape this process passes through (relayed) or refuses
-// as inference-like (blocked): the method and the path with id-like segments replaced, never a query or an
-// id. The CloudWatch alarms UnlistedRoute and BlockedRoute are metric filters on these two lines.
-func (p *Proxy) noteRoute(relayed bool, method, path string) {
+// noteRoute logs the first request of each unlisted route shape this process relays: the method and the
+// path with id-like segments replaced, never a query or an id. The reference deployment alarms on the
+// line (UnlistedRoute) as a review queue: the route already works; list it once it is reviewed.
+func (p *Proxy) noteRoute(method, path string) {
 	shape := proxyRouteShape(path)
-	kind := "blocked"
-	if relayed {
-		kind = "relayed"
-	}
-	if _, seen := p.routes.LoadOrStore(kind+" "+method+" "+shape, struct{}{}); seen {
+	if _, seen := p.routes.LoadOrStore(method+" "+shape, struct{}{}); seen {
 		return
 	}
-	if relayed {
-		lg().Info("relayed an unlisted Anthropic route", "method", method, "route", shape)
-		return
-	}
-	lg().Warn("blocked an inference-like route", "method", method, "route", shape)
+	lg().Info("relayed an unlisted Anthropic route", "method", method, "route", shape)
 }
 
 // proxyRouteShape replaces id-like segments (with a digit, or longer than 24 characters) by :id; an API
@@ -853,9 +804,9 @@ func proxyControlPath(method, path string) bool {
 	return false
 }
 
-// Audited native Claude Code releases use these exact control-plane routes to acquire,
-// acknowledge, renew, stop, and reconnect bridge work. Do not permit the whole
-// environments subtree: an unknown endpoint must still fail closed.
+// The environment routes audited native Claude Code releases use to acquire, acknowledge, renew, stop
+// and reconnect bridge work. Being listed only keeps a route out of the unlisted-route log; every route
+// is relayed.
 func proxyEnvironmentControl(method, suffix string) bool {
 	parts := strings.Split(suffix, "/")
 	if (len(parts) != 3 && len(parts) != 4) || !proxyControlID(parts[0]) {
