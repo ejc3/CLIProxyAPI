@@ -861,6 +861,11 @@ func (s *backendSeriesSelector) boundUnavailableErrorLocked(ctx context.Context,
 		case status == http.StatusNotFound && backendUpstreamErrorFrom(ctx).notFoundWithoutAnthropicError():
 			// Not "model not found": Anthropic names that. Retried once already (backendRetryNotFound).
 			refusal.reason = fmt.Sprintf("subscription %s answered HTTP 404 with no Anthropic error for model %s, twice; that is not a model it cannot serve, and the pool moves a conversation only for a used-up weekly quota. Retry, or switch model with /model", name, model)
+		case status == http.StatusNotFound && !backendUpstreamErrorFrom(ctx).notFoundNamesModel(model):
+			// Anthropic's not_found_error, but about something in the request (a file, a container, a
+			// resource of another account), not the model. The session has Anthropic's own message.
+			refusal.kind = backendRefusalNotFound
+			refusal.reason = fmt.Sprintf("subscription %s: Anthropic answered 404 not_found_error for model %s about something in the request, not the model (the message is in the response and the server log); the pool moves a conversation only for a used-up weekly quota. Start a fresh session, or switch model with /model", name, model)
 		case status == http.StatusNotFound:
 			refusal.kind = backendRefusalNotFound
 			refusal.reason = fmt.Sprintf("subscription %s does not serve model %s (HTTP 404); the pool moves a conversation only for a used-up weekly quota, not for a model it cannot serve. Switch model with /model", name, model)

@@ -1,16 +1,23 @@
 package claudemaster
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
@@ -79,11 +86,17 @@ func (k backendRefusalKind) errorType() string {
 	return "overloaded_error"
 }
 
-// backendUpstreamError is one upstream error response, kept exactly as received.
+// backendUpstreamError is one upstream error response, kept as received except that a
+// compressed body is decoded once here (and Content-Encoding/Content-Length dropped with it), so
+// the proxy can read the error it relays. The native passthrough hands the body over as Anthropic
+// sent it, compressed: on 2026-10-10 every logged 404 read "type= message=" and its body prefix was
+// noise, 234 bytes of application/json behind a Content-Encoding the proxy never looked at.
 type backendUpstreamError struct {
-	status  int
-	headers http.Header
-	body    []byte
+	status      int
+	headers     http.Header
+	body        []byte
+	encoding    string // the Content-Encoding the body arrived with ("" when none)
+	decodeError string // why a declared encoding could not be decoded (the body is then kept raw)
 }
 
 type backendUpstreamResponseError interface {
@@ -122,7 +135,84 @@ func noteBackendUpstreamErrorFor(ctx context.Context, authID, model string, err 
 }
 
 func backendUpstreamRecord(upstream backendUpstreamResponseError) *backendUpstreamError {
-	return &backendUpstreamError{status: upstream.StatusCode(), headers: upstream.ResponseHeaders(), body: append([]byte(nil), upstream.ResponseBody()...)}
+	record := &backendUpstreamError{status: upstream.StatusCode(), headers: upstream.ResponseHeaders().Clone(), body: append([]byte(nil), upstream.ResponseBody()...)}
+	if record.headers == nil {
+		record.headers = http.Header{}
+	}
+	record.encoding = strings.Join(record.headers.Values("Content-Encoding"), ",")
+	plain, err := backendDecodeBody(record.body, record.encoding)
+	switch {
+	case err != nil:
+		record.decodeError = err.Error()
+	case plain != nil:
+		record.body = plain
+		record.headers.Del("Content-Encoding")
+		record.headers.Del("Content-Length")
+	}
+	return record
+}
+
+// backendDecodeBody undoes the Content-Encoding chain Anthropic (through Cloudflare) answers with:
+// gzip, deflate (zlib or raw), br, zstd, in any order, as the executors' own decoder does. With no
+// header it recognises gzip and zstd by their magic bytes. It returns nil, nil when there was
+// nothing to decode, and an error (body untouched) when a declared encoding does not decode.
+func backendDecodeBody(body []byte, contentEncoding string) ([]byte, error) {
+	encodings := []string{}
+	for _, enc := range strings.Split(contentEncoding, ",") {
+		if enc = strings.ToLower(strings.TrimSpace(enc)); enc != "" && enc != "identity" {
+			encodings = append(encodings, enc)
+		}
+	}
+	if len(encodings) == 0 {
+		switch {
+		case len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b:
+			encodings = []string{"gzip"}
+		case len(body) >= 4 && body[0] == 0x28 && body[1] == 0xb5 && body[2] == 0x2f && body[3] == 0xfd:
+			encodings = []string{"zstd"}
+		default:
+			return nil, nil
+		}
+	}
+	const limit = 1 << 20
+	out := body
+	for i := len(encodings) - 1; i >= 0; i-- {
+		var reader io.Reader
+		switch encodings[i] {
+		case "gzip", "x-gzip":
+			gz, err := gzip.NewReader(bytes.NewReader(out))
+			if err != nil {
+				return nil, fmt.Errorf("gzip: %w", err)
+			}
+			reader = gz
+		case "deflate":
+			zr, err := zlib.NewReader(bytes.NewReader(out))
+			if err != nil {
+				reader = flate.NewReader(bytes.NewReader(out))
+			} else {
+				reader = zr
+			}
+		case "br":
+			reader = brotli.NewReader(bytes.NewReader(out))
+		case "zstd":
+			zd, err := zstd.NewReader(bytes.NewReader(out))
+			if err != nil {
+				return nil, fmt.Errorf("zstd: %w", err)
+			}
+			defer zd.Close()
+			reader = zd
+		default:
+			return nil, fmt.Errorf("unknown content encoding %q", encodings[i])
+		}
+		plain, err := io.ReadAll(io.LimitReader(reader, limit+1))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", encodings[i], err)
+		}
+		if len(plain) > limit {
+			return nil, fmt.Errorf("%s: decoded body exceeds %d bytes", encodings[i], limit)
+		}
+		out = plain
+	}
+	return out, nil
 }
 
 // anthropicError reads the body as Anthropic's own error object ({"type":"error","error":{...}});
@@ -184,6 +274,8 @@ func backendUpstreamLogFields(authID, model string, upstream *backendUpstreamErr
 	return append(fields,
 		"anthropic_error", false,
 		"content_type", h.Get("Content-Type"),
+		"content_encoding", upstream.encoding,
+		"decode_error", upstream.decodeError,
 		"request_id", h.Get("Request-Id"),
 		"cf_ray", h.Get("Cf-Ray"),
 		"server", h.Get("Server"),
@@ -206,6 +298,19 @@ func backendPrintablePrefix(body []byte, limit int) string {
 		}
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// notFoundNamesModel: Anthropic's "model not found" names the model in its message. With no
+// recorded body (a failure that carried none) the model is assumed, as before.
+func (u *backendUpstreamError) notFoundNamesModel(model string) bool {
+	if u == nil {
+		return true
+	}
+	_, message, anthropic := u.anthropicError()
+	if !anthropic {
+		return true
+	}
+	return model == "" || strings.Contains(message, model) || strings.Contains(strings.ToLower(message), "model")
 }
 
 // backendNotFoundRetryDelay is the pause before the one retry of a 404 with no Anthropic error.
