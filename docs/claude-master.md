@@ -337,10 +337,19 @@ later request.
   anything else in it (`--require`, `--import`, `--use-openssl-ca`, ...) stays refused. A value that cannot be read as a settings object is refused, because its effect is
   unknown. This is a guard against accidental or wrapper-injected redirection, not a defence against a user who can
   already run Claude directly.
-- The local proxy is an HTTPS listener that requires a client certificate; there is no password.
-  A launch makes a throwaway CA and one client certificate for its own Claude child, passed
-  through `CLAUDE_CODE_CLIENT_CERT` / `CLAUDE_CODE_CLIENT_KEY`. The CA is trusted only by the
-  child through `NODE_EXTRA_CA_CERTS`; it is not installed in the system trust store. The CA is
+- Claude's proxy is a **local forwarder**: plain HTTP on an ephemeral loopback port, given to
+  Claude as `HTTPS_PROXY=http://claude-master:<token>@127.0.0.1:<port>` with a fresh random token
+  per launch. A CONNECT to `api.anthropic.com:443` that carries the token goes on to the
+  claude-master proxy; every other CONNECT is dialled from this box and relayed blind. So the
+  commands, hooks, MCP servers and status line Claude starts inherit a proxy that is transparent
+  to them (`git`, `curl`, `gh`, package managers work unchanged), their traffic leaves from this
+  box rather than the server, and a `claude` they start stays on the pool. A process that reaches
+  `api.anthropic.com` through the forwarder without Node's `NODE_EXTRA_CA_CERTS` (a Python SDK
+  script, say) sees the launch CA and fails, as before.
+- The claude-master proxy behind the forwarder is an HTTPS listener that requires a client
+  certificate; there is no password. The forwarder presents it: the launch's own throwaway
+  client certificate for `run`, this box's for `connect`; Claude holds none. The CA is trusted
+  only by Claude through `NODE_EXTRA_CA_CERTS`; it is not installed in the system trust store. The CA is
   constrained to the DNS name `api.anthropic.com`. It carries no IP-range constraint, because
   Claude's TLS stack rejects a trusted CA that has one (`unsupported name constraint type`). Leaf certificates renew on new handshakes without interrupting
   existing streams, so a long-running launcher does not lose TLS after a week.
