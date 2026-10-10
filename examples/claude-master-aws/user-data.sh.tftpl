@@ -243,7 +243,22 @@ for _ in $(seq 1 20); do
   curl -fsS http://127.0.0.1:9901/clusters 2>/dev/null | grep -q "^cert::${private_ip}:$(port_of "$next")::" && { switched=1; break; }
   sleep 0.5
 done
-[ "$switched" = 1 ] || { echo "Envoy did not report $next; leaving $active running" >&2; exit 1; }
+if [ "$switched" != 1 ]; then
+  # Envoy may already be sending some new connections to $next: point it back at the recorded color, so the
+  # record and Envoy agree and a retry does not restart the server that is taking traffic.
+  if [ "$active" != none ]; then
+    /usr/local/bin/claude-master-envoy-endpoints "$active"
+    for _ in $(seq 1 20); do
+      curl -fsS http://127.0.0.1:9901/clusters 2>/dev/null | grep -q "^cert::${private_ip}:$(port_of "$active")::" && break
+      sleep 0.5
+    done
+    systemctl stop "claude-master-server@$next"
+    echo "Envoy did not report $next; pointed it back at $active and stopped $next" >&2
+  else
+    echo "Envoy did not report $next; $next keeps running (nothing else is serving)" >&2
+  fi
+  exit 1
+fi
 echo "$next" > /etc/claude-master/active-color
 systemctl enable "claude-master-server@$next" >/dev/null 2>&1 || true
 echo "new connections go to $next"
