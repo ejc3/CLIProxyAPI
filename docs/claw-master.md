@@ -248,7 +248,54 @@ subscription is taken out only by Anthropic's own answer to a real request: a cr
 `429` (`anthropic-ratelimit-unified-status: rejected`), for its `retry-after` or unified reset,
 or a dead login. When Anthropic accepts a request on a subscription the poll puts in its reserve
 band or calls exhausted, the log says so once per profile per band
-(`Anthropic accepted a request on a subscription the usage poll calls exhausted`).
+(`Anthropic accepted a request on a subscription the usage poll calls exhausted`). The one exception
+is opt-in: a profile reserve (below) the owner configures, which takes a subscription out on the
+polled weekly figure (or always, at 100).
+
+### Holding part of a subscription out of the pool: `--profile-reserve-file`
+
+`serve --profile-reserve-file PATH` names a file of `PROFILE=N` lines, where `PROFILE` is a
+subscription profile's name and `N` a whole percent from 0 to 100. A line starting with `#` is a
+comment; blank lines are ignored.
+
+```text
+# kept for its owner's own sessions, never used by the pool
+claude-kept-20261112=100
+# the pool may use 70% of this week, the last 30% is kept back
+claude-secondary=30
+```
+
+A reserve of N holds the last N% of that subscription's weekly allowance back: the pool treats the
+profile as out once its weekly usage (from the usage poll and the response headers) reaches
+(100 - N)%. N = 100 means always out, never used by the pool, whatever the poll says or whether it
+works. N = 0, or no line, is the ordinary behaviour above. Only the weekly window counts, not the
+five-hour one. While the weekly figure is unknown (the poll has not answered) a reserve below 100
+does not take the profile out. (This is not the poll's 90% reserve band, which only orders
+candidates.) A profile's reserve lifts by itself at its weekly reset, when the week
+starts again at 0%. The API-key backup is never reserved. A name that is not in the pool has no effect.
+
+Out by its reserve behaves as out by Anthropic's credential-scoped `429`:
+
+- New conversations do not select it, and a self-contained request bound to it moves to the
+  best-ranked eligible subscription (switch reason `reserved`).
+- An opaque/account-bound continuation stays bound and is refused with the same `429` a rejected
+  subscription gets (`rate_limit_error`, the weekly rejection headers, `x-should-retry: true`):
+  `retry-after` is the profile's weekly reset for a reserve below 100, and one hour for a reserve of
+  100 (or an unknown reset), since only a change to the file lifts it. The reason header says the
+  conversation must start afresh to use another subscription. When the profile is also rejected by
+  Anthropic, the later of the two times is given.
+- When every subscription is out, by reserve or by `429`, the pool does what it does when Anthropic
+  has rejected them all: it uses the API-key backup if one is configured and able to pay, or answers
+  `429` with the earliest time one comes back (an hour, when the only ones left are reserved at 100).
+
+The file is read at start and looked at every minute; when it has changed (replace it with a
+rename) it is loaded again and the reserves swapped in, with no restart. A file that cannot be read,
+or has any invalid line (not `PROFILE=N`, N outside 0..100 or not a whole number, a profile named
+twice), is not loaded: the reserves already in use stay (none, at start) and the log says why, naming
+the line number. The server starts whether the file is missing or bad. The log says `profile reserves
+loaded` with each `profile=N`, and once when a profile enters or leaves reserve-out (`profile held in
+reserve: out of the pool` / `profile released from reserve: back in the pool`, with its `used_pct`
+and `threshold_pct`). `claw_master.quota.reserved` {profile} is 1 while a reserve holds a profile out.
 
 Quota state is refreshed from Anthropic's rate-limit response headers. A
 credential-scoped `429` temporarily blocks that account until its retry/reset deadline;
@@ -288,6 +335,7 @@ A conversation keeps its account while that account can serve the request:
   rejection holds they get Anthropic's `429` back with the time it ends.
 - When Anthropic has rejected every account, the pool answers Anthropic's `429` with the
   earliest time one comes back (or uses the API-key backup, if configured and able to pay).
+- A profile reserve (`--profile-reserve-file`, above) takes a subscription out the same way.
 - When the rejection's deadline passes, the account is asked again, whatever the poll says.
 
 The usage endpoint is an OAuth product endpoint used by Claude Code rather than a
@@ -746,12 +794,13 @@ backs that discipline up by masking secret-shaped keys and values.
 
 | level | event |
 |---|---|
-| info | `inference account switched` (conversation moved: `from`, `to`, `reason` = `weekly_exhausted` (Anthropic rejected it and the poll agrees the week is used up), `rate_limited` (rejected for another limit), `rebalanced`, `subscriptions_exhausted`, `subscription_capacity_returned`) |
+| info | `inference account switched` (conversation moved: `from`, `to`, `reason` = `weekly_exhausted` (Anthropic rejected it and the poll agrees the week is used up), `rate_limited` (rejected for another limit), `reserved` (its profile reserve took it out), `rebalanced`, `subscriptions_exhausted`, `subscription_capacity_returned`) |
 | info | `profile rate limited` / `profile available again`; `quota band changed` (`ok` / `reserve` at 90% / `exhausted`: what the poll says, not a refusal); `Anthropic accepted a request on a subscription the usage poll calls exhausted` (or `reserve`), once per profile per band |
+| info | `profile reserves loaded` (`reserves` = each `profile=N`); `profile held in reserve: out of the pool` / `profile released from reserve: back in the pool` (`reserve_pct`, `threshold_pct`, `used_pct`), once per change; the 5-minute `quota` line gains `reserve_pct` and `reserved` for a profile with a reserve |
 | info | `login refreshed`, `login refresh adopted from another claw-master process`, `adopted a newer login after a 401` |
 | info | `quota` per profile (weekly, plus `five_hour_used_pct` and `five_hour_resets_in`) and `routing summary` (requests per profile, switches, backup picks, refusals) every 5 minutes; `proxy summary` (connections, requests, active) every 5 minutes |
 | info | `client connected for the first time` (certificate name, or `tunnel`), `proxy listening`, `inference backend started` |
-| warn | `using the paid API-key backup` (once a minute), `no inference account could be chosen`, `profile credential rejected by Anthropic` (401/403: the login may need redoing), `Anthropic server error`, `login refresh failed`, `subscription usage poll failed`, `client TLS handshake failed` (once a minute per remote address) |
+| warn | `profile reserve file was not loaded` (at start) / `profile reserve file changed but was not loaded` (the previous reserves stay), with why; `using the paid API-key backup` (once a minute), `no inference account could be chosen`, `profile credential rejected by Anthropic` (401/403: the login may need redoing), `Anthropic server error`, `login refresh failed`, `subscription usage poll failed`, `client TLS handshake failed` (once a minute per remote address) |
 | debug | every routing decision (`account chosen`), `conversation bound`, every quota observation, each client tunnel |
 
 ## Metrics (OpenTelemetry)
@@ -796,6 +845,7 @@ from its credential file name (those carry the account's email address).
 | `claw_master.inference.tokens` {profile, type}, `.tokens.by_client_account` {client_account, type}, `.tokens.by_client` {client, type}, `.tokens.by_project` {project, type} | counter | tokens each subscription (or `api-backup`) served, each user used, each box carried and each project asked for (`project` is the name of the git repository a launch was started in, or of its directory, sent by the launch's forwarder on its tunnel; `none` without one, `other` past 100 names per process); `type` is `input`, `output`, `cache_read` or `cache_creation` (input excludes the cache fields, output includes thinking), from the usage Anthropic reports in each successful response |
 | `claw_master.inference.request_bytes`, `.response_bytes` {profile} | histogram | sizes |
 | `claw_master.quota.used_fraction`, `.resets_in_seconds`, `.rate_limited_for_seconds`, `.band` {profile} | gauge | each subscription's weekly allowance, when it resets, any cooldown, band (0 ok, 1 reserve, 2 exhausted, -1 unknown) |
+| `claw_master.quota.reserved` {profile} | gauge | 1 while the profile's reserve (`--profile-reserve-file`) holds it out of the pool, else 0; only for a profile with a reserve configured, so a pool with none adds no series |
 | `claw_master.profile.info` {profile, email} | gauge | 1 per subscription profile with the email of the account it is logged in to, from its saved credential, so a dashboard can say which account each profile is. The only metric with an account identifier; the incoming users' accounts are never in it |
 | `claw_master.quota.five_hour.used_fraction`, `.five_hour.resets_in_seconds` {profile} | gauge | each subscription's five-hour window from the usage poll (about every 3 minutes, idle or not, in a pool of two or more profiles or with a backup key); 0 once the window has reset, and no countdown while no window is open |
 | `claw_master.anthropic.ratelimit` {profile, window, measure} | gauge | EVERY `Anthropic-Ratelimit-*` header: windows `5h`, `7d`, `api`; measures `utilization`, `resets_in_seconds`, `remaining`, `limit` ... |
