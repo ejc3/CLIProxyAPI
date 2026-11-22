@@ -303,7 +303,11 @@ Without the mode word, out by its reserve behaves as out by Anthropic's credenti
   `429` with the earliest time one comes back (an hour, when the only ones left are reserved at 100).
 
 The file is read at start and looked at every minute; when it has changed (replace it with a
-rename) it is loaded again and the reserves swapped in, with no restart. A file that cannot be read,
+rename) and the change is still the same at the next look, it is loaded again and the reserves swapped
+in, with no restart, so within about two minutes. The wait is because a file edited in place can be
+read half-written, and a prefix may parse (`claude-x=100` cut to `claude-x=1`, or an empty file).
+A self-contained conversation on a reserved profile with no other subscription usable gets the
+pool-wide refusal (the earliest time any subscription comes back), not the reserved profile's. A file that cannot be read,
 or has any invalid line (not `PROFILE=N` or `PROFILE=N last-resort`, any other word after the percent,
 N outside 0..100 or not a whole number, a profile named twice), is not loaded: the reserves already in use stay (none, at start) and the log says why, naming
 the line number. The server starts whether the file is missing or bad. The log says `profile reserves
@@ -816,7 +820,7 @@ backs that discipline up by masking secret-shaped keys and values.
 | info | `login refreshed`, `login refresh adopted from another claw-master process`, `adopted a newer login after a 401` |
 | info | `quota` per profile (weekly, plus `five_hour_used_pct` and `five_hour_resets_in`) and `routing summary` (requests per profile, switches, backup picks, refusals) every 5 minutes; `proxy summary` (connections, requests, active) every 5 minutes |
 | info | `client connected for the first time` (certificate name, or `tunnel`), `proxy listening`, `inference backend started` |
-| warn | `profile reserve file was not loaded` (at start) / `profile reserve file changed but was not loaded` (the previous reserves stay), with why; `using the paid API-key backup` (once a minute), `no inference account could be chosen`, `profile credential rejected by Anthropic` (401/403: the login may need redoing), `Anthropic server error`, `login refresh failed`, `subscription usage poll failed`, `client TLS handshake failed` (once a minute per remote address) |
+| warn | `profile reserve file was not loaded` (at start) / `profile reserve file changed but was not loaded` (the previous reserves stay), with why; `using the paid API-key backup` (once a minute; it says `or held out of the pool by their reserve` when a reserve is part of why), `no inference account could be chosen`, `profile credential rejected by Anthropic` (401/403: the login may need redoing), `Anthropic server error`, `login refresh failed`, `subscription usage poll failed`, `client TLS handshake failed` (once a minute per remote address) |
 | debug | every routing decision (`account chosen`), `conversation bound`, every quota observation, each client tunnel |
 
 ## Metrics (OpenTelemetry)

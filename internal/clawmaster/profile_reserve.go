@@ -154,13 +154,16 @@ func StartProfileReserves(ctx context.Context, file string, every time.Duration)
 
 // WatchProfileReserves re-reads the reserve file when it changes (a new inode, size or modification time:
 // replace it with a rename) and swaps the reserves in, so a change reaches routing without a restart. A
-// file that does not load keeps the reserves in use, and the failure is logged once for that version of the
-// file. It returns when ctx ends.
+// change is acted on only once it has held still for one check: a file edited in place can be read
+// half-written, and a prefix may parse (PROFILE=100 cut to PROFILE=1, or an empty file, which is no
+// reserves). A file that does not load keeps the reserves in use, and the failure is logged once for that
+// version of the file. It returns when ctx ends.
 func WatchProfileReserves(ctx context.Context, file string, every time.Duration) {
 	watchProfileReservesFrom(ctx, file, accountLabelsFingerprint(file), every)
 }
 
 func watchProfileReservesFrom(ctx context.Context, file, last string, every time.Duration) {
+	watch := &profileReserveWatch{file: file, last: last}
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
@@ -169,19 +172,36 @@ func watchProfileReservesFrom(ctx context.Context, file, last string, every time
 			return
 		case <-ticker.C:
 		}
-		now := accountLabelsFingerprint(file)
-		if now == last || now == "" {
-			continue
-		}
-		last = now
-		reserves, err := LoadProfileReserves(file)
-		if err != nil {
-			lg().Warn("profile reserve file changed but was not loaded; the previous reserves stay", "why", err.Error())
-			continue
-		}
-		if SetProfileReserves(reserves) {
-			lg().Info("profile reserves loaded", "reserves", describeProfileReserves(reserves))
-		}
+		watch.check()
+	}
+}
+
+// profileReserveWatch is the watcher's state: the fingerprint last acted on, and a new one seen once and
+// waiting to be seen unchanged at the next check.
+type profileReserveWatch struct {
+	file, last, pending string
+}
+
+// check is one look at the file. A new fingerprint is loaded only when the previous check saw the same
+// one, so a write still in progress at one check is never loaded.
+func (w *profileReserveWatch) check() {
+	now := accountLabelsFingerprint(w.file)
+	if now == "" || now == w.last {
+		w.pending = ""
+		return
+	}
+	if now != w.pending {
+		w.pending = now
+		return
+	}
+	w.last, w.pending = now, ""
+	reserves, err := LoadProfileReserves(w.file)
+	if err != nil {
+		lg().Warn("profile reserve file changed but was not loaded; the previous reserves stay", "why", err.Error())
+		return
+	}
+	if SetProfileReserves(reserves) {
+		lg().Info("profile reserves loaded", "reserves", describeProfileReserves(reserves))
 	}
 }
 

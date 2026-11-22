@@ -203,6 +203,52 @@ func TestProfileReservesReloadWhenTheFileChanges(t *testing.T) {
 	waitForReserve(t, "reserve-reload-b", 0)
 }
 
+// A file edited in place can be read half-written, and a prefix may parse: claude-x=100 cut to
+// claude-x=1, or an empty file. A change is loaded only once it is unchanged at the next check, so the
+// prefix seen at one check is never loaded.
+func TestAReserveFileReadHalfWrittenIsNotLoaded(t *testing.T) {
+	setProfileReservesForTest(t, map[string]int{"reserve-half-a": 100})
+	file := filepath.Join(t.TempDir(), "reserves")
+	write := func(body string) { // in place, not by a rename
+		t.Helper()
+		if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("reserve-half-a=100\n")
+	watch := &profileReserveWatch{file: file, last: accountLabelsFingerprint(file)}
+	watch.check()
+	if profileReserveFor("reserve-half-a").Percent != 100 {
+		t.Fatal("an unchanged file changed the reserves")
+	}
+	for _, partial := range []string{"reserve-half-a=1", ""} {
+		write(partial) // the writer is part way through
+		watch.check()
+		if got := profileReserveFor("reserve-half-a").Percent; got != 100 {
+			t.Fatalf("a half-written file (%q) was loaded: reserve = %d", partial, got)
+		}
+		write("reserve-half-a=100\n# done\n") // and finishes
+		watch.check()
+		if got := profileReserveFor("reserve-half-a").Percent; got != 100 {
+			t.Fatalf("after %q: reserve = %d, want 100", partial, got)
+		}
+		watch.check() // the finished file, unchanged: loaded
+		if got := profileReserveFor("reserve-half-a").Percent; got != 100 {
+			t.Fatalf("the finished file: reserve = %d, want 100", got)
+		}
+	}
+	// A real change, unchanged at the next check, is loaded then and not before.
+	write("reserve-half-a=40\n")
+	watch.check()
+	if got := profileReserveFor("reserve-half-a").Percent; got != 100 {
+		t.Fatalf("a change was loaded at its first check: reserve = %d", got)
+	}
+	watch.check()
+	if got := profileReserveFor("reserve-half-a").Percent; got != 40 {
+		t.Fatalf("a settled change was not loaded: reserve = %d, want 40", got)
+	}
+}
+
 func TestABadOrMissingReserveFileAtStartHoldsNothingBack(t *testing.T) {
 	logs := captureLogs(t, "info")
 	setProfileReservesForTest(t, nil)
@@ -292,6 +338,42 @@ func TestAFullReserveIsNeverSelected(t *testing.T) {
 	}
 	if got := strings.Count(logs.String(), "profile held in reserve: out of the pool"); got != 1 {
 		t.Fatalf("entering reserve logged %d times, want once:\n%s", got, logs.String())
+	}
+}
+
+// A self-contained conversation on a reserved subscription, with no other subscription usable, gets the
+// pool-wide refusal (the earliest time any subscription returns), not the reserved one's own refusal (its
+// weekly reset, days away, and state that "cannot move").
+func TestAPortableConversationOnAReservedSubscriptionGetsThePoolsRefusal(t *testing.T) {
+	selector, auths, reset := reserveSelector(t, map[string]int{"claude-primary": 30})
+	now := selector.now()
+	selector.observeQuota("profile-a", backendWeeklyQuota{known: true, used: 0.8, resetsAt: reset.Add(5 * 24 * time.Hour)})
+	rejectByAnthropic(selector, "profile-b", 2*time.Hour)
+	portable := plainRequest("portable")
+	bindSession(selector, portable, "profile-a")
+	_, err := selector.Pick(t.Context(), "claude", "", portable, auths)
+	refusal := requireQuotaRefusal(t, err, now.Add(2*time.Hour))
+	if strings.Contains(refusal.reason, "cannot move") || refusal.authID != "" {
+		t.Fatalf("portable refusal = %#v, want the pool-wide refusal, not the reserved subscription's", refusal)
+	}
+	// Opaque state on it still gets the reserved subscription's own refusal, at its weekly reset.
+	opaque := opaqueRequest("opaque")
+	bindSession(selector, opaque, "profile-a")
+	_, err = selector.Pick(t.Context(), "claude", "", opaque, auths)
+	if refusal := requireQuotaRefusal(t, err, reset.Add(5*24*time.Hour)); !strings.Contains(refusal.reason, "cannot move") {
+		t.Fatalf("opaque refusal = %q, want the reserved subscription's own", refusal.reason)
+	}
+}
+
+// When reserves send work to the paid backup, the warning says so.
+func TestTheBackupWarningNamesReserves(t *testing.T) {
+	logs := captureLogs(t, "info")
+	selector, auths, _ := backendAPIBackupTestSelector(t)
+	selector.names = map[string]string{"subscription-a": "sub-a", "subscription-b": "sub-b"}
+	selector.reserveFor = func(string) ProfileReserve { return ProfileReserve{Percent: 100} }
+	requireBackendAPIBackupPick(t, selector, backendAPIBackupTestOptions("reserved", false), auths, "api-backup")
+	if out := logs.String(); !strings.Contains(out, "or held out of the pool by their reserve: using the paid API-key backup") {
+		t.Fatalf("the backup warning does not name the reserves:\n%s", out)
 	}
 }
 

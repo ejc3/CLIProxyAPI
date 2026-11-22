@@ -873,9 +873,11 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 					if next := s.preferredUsableAuthLocked(ctx, availabilityModel, opts, auths, boundID); next != nil {
 						return s.bindSessionLocked(ctx, sessionID, next)
 					}
-					// A portable conversation is not stuck on its subscription: say what the pool has.
+					// A portable conversation is not stuck on its subscription: say what the pool has. That
+					// includes one whose subscription its reserve holds out: the reserved subscription's own
+					// refusal (its weekly reset, state that "cannot move") is for opaque state only.
 					var held *backendRefusalError
-					if errors.As(err, &held) && held.fable {
+					if errors.As(err, &held) && held.fable || s.reservedLocked(boundID) {
 						return nil, s.noSubscriptionRefusalLocked(ctx, "", availabilityModel)
 					}
 				}
@@ -1041,7 +1043,7 @@ func (s *backendSeriesSelector) pickBackupLocked(ctx context.Context, model stri
 		s.limiter = newEvery(time.Minute)
 	}
 	if s.limiter.allow("backup") {
-		lg().Warn("every subscription is rate limited by Anthropic: using the paid API-key backup", "session", sessionTag(sessionID))
+		lg().Warn("every subscription is rate limited by Anthropic"+s.reservedNoteLocked()+": using the paid API-key backup", "session", sessionTag(sessionID))
 	}
 	picked, err := s.pickAuthLocked(ctx, model, opts, backup)
 	if err == nil && sessionID != "" && picked != nil {
