@@ -690,6 +690,8 @@ type backendSeriesCandidate struct {
 	quota     backendWeeklyQuota
 	order     int
 	fableBand int // for a Fable request, backendSeriesSelector.fableBandRankLocked
+	// lastResort: past its last-resort reserve, so after every other candidate whatever its band
+	lastResort bool
 }
 
 // backendSeriesSelector picks the subscription for a request. The usage poll (and the weekly
@@ -733,10 +735,12 @@ type backendSeriesSelector struct {
 	stopped           bool
 
 	// reserveFor is the configured reserve of a profile name (profile_reserve.go); nil reads the reserves
-	// loaded from --profile-reserve-file. reserveOut is which subscriptions a reserve holds out now, for the
-	// once-per-change log line.
-	reserveFor func(profile string) int
-	reserveOut map[string]bool
+	// loaded from --profile-reserve-file. reserveState is what a reserve does to each subscription now
+	// ("out" or "last-resort"), for the once-per-change log line; lastResortInUse, which last-resort
+	// subscriptions have taken requests since that was last logged.
+	reserveFor      func(profile string) ProfileReserve
+	reserveState    map[string]string
+	lastResortInUse map[string]bool
 
 	names       map[string]string // runtime auth id -> the profile's own name, for logs and metrics
 	quotaBands  map[string]string
@@ -759,6 +763,9 @@ func (s *backendSeriesSelector) Pick(ctx context.Context, provider, model string
 	picked, err := s.pick(ctx, provider, model, opts, auths)
 	sessionID, _ := backendSeriesSessionIDs(opts)
 	s.noteSelection(sessionID, model, picked, err, time.Since(started))
+	if err == nil {
+		s.noteLastResortUse(sessionID, picked)
+	}
 	if err != nil {
 		noteBackendRefusal(ctx, err)
 	}
@@ -848,6 +855,13 @@ func (s *backendSeriesSelector) pick(ctx context.Context, provider, model string
 				return picked, err
 			}
 			if bound := backendSeriesAuthByID(auths, s.provider, boundID); bound != nil {
+				// A self-contained request leaves a subscription past its last-resort reserve as soon as a
+				// better-ranked one is usable; opaque state stays while the subscription can serve it.
+				if switchable && s.lastResortLocked(boundID) {
+					if next := s.preferredUsableAuthLocked(ctx, availabilityModel, opts, auths, boundID); next != nil && !s.lastResortLocked(next.ID) {
+						return s.bindSessionLocked(ctx, sessionID, next)
+					}
+				}
 				picked, err := s.pickAuthLocked(ctx, model, opts, bound)
 				if err == nil && picked != nil {
 					if inheritedParent && opaque {
@@ -1147,7 +1161,7 @@ func (s *backendSeriesSelector) preferredAuthWithAvailabilityLocked(auths []*cor
 // rankedCandidatesLocked is every configured subscription that Anthropic has not rejected (no real 429
 // in force) and no profile reserve holds out, best first. The poll orders them and excludes none: ok
 // band, then unknown, then reserve, then what the poll calls exhausted; within a band, the earliest weekly reset first, then the
-// configured order. For a Fable request, a subscription Anthropic refused Fable is left out too, and the
+// configured order. A subscription past its last-resort reserve comes after every other one. For a Fable request, a subscription Anthropic refused Fable is left out too, and the
 // Fable allowance ranks alongside the week: the worse of the two bands first, then the Fable band.
 func (s *backendSeriesSelector) rankedCandidatesLocked(auths []*coreauth.Auth, excludedAuthID string, availableOnly, fable bool) []backendSeriesCandidate {
 	ranked := make([]backendSeriesCandidate, 0, len(s.authIDs))
@@ -1158,13 +1172,16 @@ func (s *backendSeriesSelector) rankedCandidatesLocked(auths []*coreauth.Auth, e
 		if availableOnly && backendSeriesAuthByID(auths, s.provider, authID) == nil {
 			continue
 		}
-		candidate := backendSeriesCandidate{auth: &coreauth.Auth{ID: authID, Provider: s.provider}, quota: s.currentQuotaLocked(authID), order: order}
+		candidate := backendSeriesCandidate{auth: &coreauth.Auth{ID: authID, Provider: s.provider}, quota: s.currentQuotaLocked(authID), order: order, lastResort: s.lastResortLocked(authID)}
 		if fable {
 			candidate.fableBand = s.fableBandRankLocked(authID)
 		}
 		ranked = append(ranked, candidate)
 	}
 	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].lastResort != ranked[j].lastResort {
+			return ranked[j].lastResort
+		}
 		bi, bj := backendQuotaBandRank(ranked[i].quota), backendQuotaBandRank(ranked[j].quota)
 		if fable {
 			if wi, wj := max(bi, ranked[i].fableBand), max(bj, ranked[j].fableBand); wi != wj {

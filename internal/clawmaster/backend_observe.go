@@ -190,6 +190,8 @@ func (s *backendSeriesSelector) switchReasonLocked(fromID, toID string) string {
 		return "rate_limited"
 	case s.reservedLocked(fromID):
 		return "reserved"
+	case s.lastResortLocked(fromID):
+		return "last_resort"
 	}
 	return "rebalanced"
 }
@@ -325,8 +327,8 @@ func (s *backendSeriesSelector) logSnapshot(interval time.Duration) {
 			"resets_in", s.resetsIn(q), "rate_limited_for", blocked,
 			"five_hour_used_pct", fiveHourPct, "five_hour_resets_in", fiveHourResets,
 			"fable_used_pct", fablePct, "fable_resets_in", fableResets, "fable_rate_limited_for", fableBlocked}
-		if reserve := s.profileReserveLocked(id); reserve > 0 {
-			fields = append(fields, "reserve_pct", reserve, "reserved", s.reservedLocked(id))
+		if reserve := s.profileReserveLocked(id); reserve.Percent > 0 {
+			fields = append(fields, "reserve_pct", reserve.Percent, "reserved", s.reservedLocked(id), "last_resort", s.lastResortLocked(id))
 		}
 		lg().Info("quota", fields...)
 	}
@@ -426,8 +428,8 @@ func (s *backendSeriesSelector) metricsSnapshot(stores []*backendStore) stateSna
 		if s.quotaBlockedLocked(id) {
 			p.BlockedSeconds = max(s.quotaBlockedUntil[id].Sub(now).Seconds(), 0)
 		}
-		if s.profileReserveLocked(id) > 0 {
-			p.ReserveConfigured, p.Reserved = true, s.reservedLocked(id)
+		if s.profileReserveLocked(id).Percent > 0 {
+			p.ReserveConfigured, p.Reserved, p.LastResort = true, s.reservedLocked(id), s.lastResortLocked(id)
 		}
 		if five, known := s.fiveHourNowLocked(id, now); known {
 			p.FiveHourKnown, p.FiveHourUsed = true, five.UsedFraction

@@ -215,7 +215,7 @@ func run(args []string) (int, error) {
 		flags.StringVar(&openLoopback, "open-loopback", "", "also serve plain HTTP with NO client certificate on this loopback ADDRESS:PORT, for an authenticating tunnel")
 		flags.BoolVar(&balanced, "balanced", false, "a load balancer in front stops sending new connections here once a rollout begins: a stopping server serves its existing connections, closing each, instead of refusing their requests")
 		flags.DurationVar(&drainTimeout, "drain-timeout", 0, "how long a stopping server lets running requests finish (default 60s; keep systemd's TimeoutStopSec above it)")
-		flags.StringVar(&profileReserveFile, "profile-reserve-file", "", "a file of PROFILE=N lines: hold the last N% (0-100) of that subscription's weekly allowance out of the pool; re-read when it changes")
+		flags.StringVar(&profileReserveFile, "profile-reserve-file", "", "a file of PROFILE=N or PROFILE=N last-resort lines: hold the last N% (0-100) of that subscription's weekly allowance out of the pool, or with last-resort use it only when every other subscription is out; re-read when it changes")
 	case "probe":
 		flags.StringVar(&model, "model", "", "diagnostic model")
 	case "run":

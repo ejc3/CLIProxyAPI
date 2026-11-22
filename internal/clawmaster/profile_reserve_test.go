@@ -18,11 +18,12 @@ import (
 // usage reaches (100 - N)%, always at 100. It is the one opt-in exception to "the poll is advisory".
 
 func TestParseProfileReservesReadsProfileEqualsPercentLines(t *testing.T) {
-	got, err := ParseProfileReserves([]byte("# kept for its owner\nclaude-kept-20261112=100\n\n  claude-secondary = 30 \n\t# indented comment\nclaude-third=0\nclaude-fourth=007\n"))
+	got, err := ParseProfileReserves([]byte("# kept for its owner\nclaude-kept-20261112=100\n\n  claude-secondary = 30 \n\t# indented comment\nclaude-third=0\nclaude-fourth=007\nclaude-fifth=40 last-resort\n  claude-sixth =  100\t last-resort \n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]int{"claude-kept-20261112": 100, "claude-secondary": 30, "claude-third": 0, "claude-fourth": 7}
+	want := map[string]ProfileReserve{"claude-kept-20261112": {Percent: 100}, "claude-secondary": {Percent: 30}, "claude-third": {}, "claude-fourth": {Percent: 7},
+		"claude-fifth": {Percent: 40, LastResort: true}, "claude-sixth": {Percent: 100, LastResort: true}}
 	if !maps.Equal(got, want) {
 		t.Fatalf("reserves = %v, want %v", got, want)
 	}
@@ -36,10 +37,10 @@ func TestParseProfileReservesReadsProfileEqualsPercentLines(t *testing.T) {
 
 func TestParseProfileReservesRefusesEveryInvalidLine(t *testing.T) {
 	for _, tc := range []struct{ name, body, want string }{
-		{"no equals", "claude-a 30\n", "line 1: a profile reserve must be PROFILE=N"},
-		{"no profile", "=30\n", "line 1: a profile reserve must be PROFILE=N"},
-		{"bad profile name", "-claude=30\n", "line 1: a profile reserve must be PROFILE=N"},
-		{"profile with a space", "claude a=30\n", "line 1: a profile reserve must be PROFILE=N"},
+		{"no equals", "claude-a 30\n", "line 1: a profile reserve must be PROFILE=N or PROFILE=N last-resort"},
+		{"no profile", "=30\n", "line 1: a profile reserve must be PROFILE=N or PROFILE=N last-resort"},
+		{"bad profile name", "-claude=30\n", "line 1: a profile reserve must be PROFILE=N or PROFILE=N last-resort"},
+		{"profile with a space", "claude a=30\n", "line 1: a profile reserve must be PROFILE=N or PROFILE=N last-resort"},
 		{"no percent", "claude-a=\n", "line 1: the reserve of claude-a must be a whole percent from 0 to 100"},
 		{"over 100", "claude-a=101\n", "line 1: the reserve of claude-a must be a whole percent from 0 to 100"},
 		{"far over 100", "claude-a=1000\n", "line 1: the reserve of claude-a must be a whole percent from 0 to 100"},
@@ -47,10 +48,18 @@ func TestParseProfileReservesRefusesEveryInvalidLine(t *testing.T) {
 		{"plus sign", "claude-a=+5\n", "line 1: the reserve of claude-a must be a whole percent from 0 to 100"},
 		{"fraction", "claude-a=12.5\n", "line 1: the reserve of claude-a must be a whole percent from 0 to 100"},
 		{"percent sign", "claude-a=30%\n", "line 1: the reserve of claude-a must be a whole percent from 0 to 100"},
-		{"trailing comment", "claude-a=30 # mine\n", "line 1: the reserve of claude-a must be a whole percent from 0 to 100"},
+		{"trailing comment", "claude-a=30 # mine\n", "line 1: after the percent of claude-a the only word allowed is last-resort"},
+		{"misspelt mode", "claude-a=30 lastresort\n", "line 1: after the percent of claude-a the only word allowed is last-resort"},
+		{"mode in capitals", "claude-a=30 Last-Resort\n", "line 1: after the percent of claude-a the only word allowed is last-resort"},
+		{"mode with an underscore", "claude-a=30 last_resort\n", "line 1: after the percent of claude-a the only word allowed is last-resort"},
+		{"words after the mode", "claude-a=30 last-resort please\n", "line 1: after the percent of claude-a the only word allowed is last-resort"},
+		{"mode twice", "claude-a=30 last-resort last-resort\n", "line 1: after the percent of claude-a the only word allowed is last-resort"},
+		{"mode without a percent", "claude-a=last-resort\n", "line 1: the reserve of claude-a must be a whole percent from 0 to 100"},
+		{"mode before the percent", "claude-a=last-resort 30\n", "line 1: the reserve of claude-a must be a whole percent from 0 to 100"},
+		{"duplicate across modes", "claude-a=30\nclaude-a=30 last-resort\n", "line 2: claude-a is named twice"},
 		{"two equals", "claude-a=30=40\n", "line 1: the reserve of claude-a must be a whole percent from 0 to 100"},
 		{"duplicate", "claude-a=30\n# again\nclaude-a=30\n", "line 3: claude-a is named twice"},
-		{"bad line after good ones", "claude-a=30\nclaude-b=40\nnonsense\n", "line 3: a profile reserve must be PROFILE=N"},
+		{"bad line after good ones", "claude-a=30\nclaude-b=40\nnonsense\n", "line 3: a profile reserve must be PROFILE=N or PROFILE=N last-resort"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := ParseProfileReserves([]byte(tc.body))
@@ -72,28 +81,43 @@ func TestParseProfileReservesRefusesEveryInvalidLine(t *testing.T) {
 }
 
 // setProfileReservesForTest installs reserves and puts back an empty set afterwards.
+// percents is reserves without last-resort mode.
+func percents(reserves map[string]int) map[string]ProfileReserve {
+	if reserves == nil {
+		return nil
+	}
+	out := make(map[string]ProfileReserve, len(reserves))
+	for name, percent := range reserves {
+		out[name] = ProfileReserve{Percent: percent}
+	}
+	return out
+}
+
 func setProfileReservesForTest(t *testing.T, reserves map[string]int) {
 	t.Helper()
-	SetProfileReserves(reserves)
+	SetProfileReserves(percents(reserves))
 	t.Cleanup(func() { SetProfileReserves(nil) })
 }
 
 func TestSetProfileReservesReportsAChange(t *testing.T) {
 	t.Cleanup(func() { SetProfileReserves(nil) })
 	SetProfileReserves(nil)
-	if SetProfileReserves(map[string]int{}) {
+	if SetProfileReserves(percents(map[string]int{})) {
 		t.Fatal("no reserves to no reserves reported a change")
 	}
-	if !SetProfileReserves(map[string]int{"reserve-set-a": 30}) {
+	if !SetProfileReserves(percents(map[string]int{"reserve-set-a": 30})) {
 		t.Fatal("a new reserve was not reported")
 	}
-	if SetProfileReserves(map[string]int{"reserve-set-a": 30}) {
+	if SetProfileReserves(percents(map[string]int{"reserve-set-a": 30})) {
 		t.Fatal("the same reserves reported a change")
 	}
-	if !SetProfileReserves(map[string]int{"reserve-set-a": 40}) || profileReserveFor("reserve-set-a") != 40 {
+	if !SetProfileReserves(percents(map[string]int{"reserve-set-a": 40})) || profileReserveFor("reserve-set-a").Percent != 40 {
 		t.Fatal("a changed reserve was not applied")
 	}
-	if profileReserveFor("reserve-set-other") != 0 {
+	if !SetProfileReserves(map[string]ProfileReserve{"reserve-set-a": {Percent: 40, LastResort: true}}) || !profileReserveFor("reserve-set-a").LastResort {
+		t.Fatal("a change of mode was not applied")
+	}
+	if profileReserveFor("reserve-set-other").Percent != 0 {
 		t.Fatal("a profile with no line has a reserve")
 	}
 }
@@ -112,9 +136,9 @@ func replaceFile(t *testing.T, file, body string) {
 func waitForReserve(t *testing.T, name string, want int) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	for profileReserveFor(name) != want {
+	for profileReserveFor(name).Percent != want {
 		if time.Now().After(deadline) {
-			t.Fatalf("reserve of %s = %d, want %d", name, profileReserveFor(name), want)
+			t.Fatalf("reserve of %s = %d, want %d", name, profileReserveFor(name).Percent, want)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -128,7 +152,7 @@ func TestProfileReservesReloadWhenTheFileChanges(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	StartProfileReserves(ctx, file, 10*time.Millisecond)
-	if profileReserveFor("reserve-reload-a") != 100 {
+	if profileReserveFor("reserve-reload-a").Percent != 100 {
 		t.Fatal("the reserves were not loaded at start")
 	}
 	if out := logs.String(); !strings.Contains(out, "profile reserves loaded") || !strings.Contains(out, "reserve-reload-a=100") {
@@ -142,18 +166,36 @@ func TestProfileReservesReloadWhenTheFileChanges(t *testing.T) {
 	// A file that does not load keeps the reserves in use, and says why.
 	replaceFile(t, file, "reserve-reload-a=30\nreserve-reload-a=60\n")
 	time.Sleep(100 * time.Millisecond)
-	if profileReserveFor("reserve-reload-a") != 30 || profileReserveFor("reserve-reload-b") != 50 {
+	if profileReserveFor("reserve-reload-a").Percent != 30 || profileReserveFor("reserve-reload-b").Percent != 50 {
 		t.Fatal("a bad file replaced the reserves")
 	}
 	if out := logs.String(); !strings.Contains(out, "profile reserve file changed but was not loaded") || !strings.Contains(out, "named twice") {
 		t.Fatalf("the refused reload was not logged with its reason:\n%s", out)
+	}
+	// So does a bad mode word: the last-resort mode is spelt one way.
+	replaceFile(t, file, "reserve-reload-a=80 last_resort\n")
+	time.Sleep(100 * time.Millisecond)
+	if r := profileReserveFor("reserve-reload-a"); r.Percent != 30 || r.LastResort || profileReserveFor("reserve-reload-b").Percent != 50 {
+		t.Fatalf("a bad mode word replaced the reserves: %+v", r)
+	}
+	// A good last-resort line is loaded.
+	replaceFile(t, file, "reserve-reload-a=30 last-resort\nreserve-reload-b=50\n")
+	deadline := time.Now().Add(5 * time.Second)
+	for !profileReserveFor("reserve-reload-a").LastResort {
+		if time.Now().After(deadline) {
+			t.Fatal("the last-resort mode was not loaded")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if out := logs.String(); !strings.Contains(out, "reserve-reload-a=30/last-resort") {
+		t.Fatalf("the load did not log the mode:\n%s", out)
 	}
 	// A file that disappears keeps them too; the next good file is loaded.
 	if err := os.Remove(file); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(50 * time.Millisecond)
-	if profileReserveFor("reserve-reload-a") != 30 {
+	if profileReserveFor("reserve-reload-a").Percent != 30 {
 		t.Fatal("a removed file dropped the reserves")
 	}
 	replaceFile(t, file, "reserve-reload-a=0\n")
@@ -170,7 +212,7 @@ func TestABadOrMissingReserveFileAtStartHoldsNothingBack(t *testing.T) {
 	bad := filepath.Join(dir, "bad")
 	replaceFile(t, bad, "reserve-start-a=101\n")
 	StartProfileReserves(ctx, bad, 10*time.Millisecond)
-	if profileReserveFor("reserve-start-a") != 0 {
+	if profileReserveFor("reserve-start-a").Percent != 0 {
 		t.Fatal("a bad file at start held a profile back")
 	}
 	if out := logs.String(); !strings.Contains(out, "profile reserve file was not loaded") || !strings.Contains(out, "whole percent") {
@@ -188,7 +230,7 @@ func TestABadOrMissingReserveFileAtStartHoldsNothingBack(t *testing.T) {
 func reserveSelector(t *testing.T, reserves map[string]int) (*backendSeriesSelector, []*coreauth.Auth, time.Time) {
 	t.Helper()
 	selector, auths, reset := namedSelector(t)
-	selector.reserveFor = func(name string) int { return reserves[name] }
+	selector.reserveFor = func(name string) ProfileReserve { return ProfileReserve{Percent: reserves[name]} }
 	return selector, auths, reset
 }
 
@@ -315,7 +357,7 @@ func TestAZeroReserveIsTheOrdinaryBehaviour(t *testing.T) {
 func TestReservesNeverHoldTheAPIBackup(t *testing.T) {
 	selector, auths, reset := backendAPIBackupTestSelector(t)
 	selector.names = map[string]string{"subscription-a": "sub-a", "subscription-b": "sub-b", "api-backup": "api-backup"}
-	selector.reserveFor = func(string) int { return 100 } // every name, the backup's included
+	selector.reserveFor = func(string) ProfileReserve { return ProfileReserve{Percent: 100} } // every name, the backup's included
 	selector.observeQuota("subscription-a", backendWeeklyQuota{known: true, used: 0.1, resetsAt: reset})
 	selector.mu.Lock()
 	backupReserved := selector.reservedLocked("api-backup")
@@ -376,4 +418,109 @@ func TestTheReservedGaugeShowsWhichProfilesAReserveHoldsOut(t *testing.T) {
 	if _, ok := gaugeOf(rm, "claw_master.quota.reserved", map[string]string{"profile": "claude-secondary"}); ok {
 		t.Error("a profile with no reserve has a reserved gauge")
 	}
+}
+
+// lastResortSelector is namedSelector with profile-a (claude-primary) on a last-resort reserve of 30 and
+// past it, and profile-b (claude-secondary) with no reserve and plenty left.
+func lastResortSelector(t *testing.T) (*backendSeriesSelector, []*coreauth.Auth, time.Time) {
+	t.Helper()
+	selector, auths, reset := namedSelector(t)
+	selector.reserveFor = func(name string) ProfileReserve {
+		if name == "claude-primary" {
+			return ProfileReserve{Percent: 30, LastResort: true}
+		}
+		return ProfileReserve{}
+	}
+	selector.observeQuota("profile-a", backendWeeklyQuota{known: true, used: 0.8, resetsAt: reset})
+	selector.observeQuota("profile-b", backendWeeklyQuota{known: true, used: 0.95, resetsAt: reset.Add(48 * time.Hour)})
+	return selector, auths, reset
+}
+
+// Past a last-resort reserve the subscription is not out but ranks after every other: skipped while any
+// other is usable, even one the poll puts in its reserve band and that resets later.
+func TestALastResortIsSkippedWhileAnyOtherIsUsable(t *testing.T) {
+	logs := captureLogs(t, "info")
+	selector, auths, reset := lastResortSelector(t)
+	requireBackendSeriesPickWith(t, selector, plainRequest("new"), auths, "profile-b")
+	selector.mu.Lock()
+	reserved, lastResort, exhausted := selector.reservedLocked("profile-a"), selector.lastResortLocked("profile-a"), selector.subscriptionsExhaustedLocked()
+	selector.mu.Unlock()
+	if reserved || !lastResort || exhausted {
+		t.Fatalf("reserved=%v last_resort=%v exhausted=%v; want a last resort that is not out", reserved, lastResort, exhausted)
+	}
+	if out := logs.String(); !strings.Contains(out, "profile past its reserve: used only as a last resort") || !strings.Contains(out, "threshold_pct=70") {
+		t.Fatalf("entering last resort was not logged:\n%s", out)
+	}
+
+	// A self-contained conversation bound to it moves as soon as a better one is usable.
+	moving := plainRequest("moving")
+	bindSession(selector, moving, "profile-a")
+	requireBackendSeriesPickWith(t, selector, moving, auths, "profile-b")
+	if out := logs.String(); !strings.Contains(out, "reason=last_resort") {
+		t.Fatalf("the move off a last resort was not logged as last_resort:\n%s", out)
+	}
+	// Opaque state bound to it stays while it can serve.
+	opaque := opaqueRequest("opaque")
+	bindSession(selector, opaque, "profile-a")
+	requireBackendSeriesPickWith(t, selector, opaque, auths, "profile-a")
+	if strings.Contains(logs.String(), "last-resort profile used") {
+		t.Fatalf("a conversation that stayed while others could serve was logged as a last-resort use:\n%s", logs.String())
+	}
+
+	// Below its threshold (a new week) it ranks by the poll as usual: it resets first, so it is first.
+	selector.observeQuota("profile-a", backendWeeklyQuota{known: true, used: 0.1, resetsAt: reset.Add(7 * 24 * time.Hour)})
+	selector.observeQuota("profile-b", backendWeeklyQuota{known: true, used: 0.1, resetsAt: reset.Add(8 * 24 * time.Hour)})
+	requireBackendSeriesPickWith(t, selector, plainRequest("next-week"), auths, "profile-a")
+}
+
+// Every other subscription out (rejected by Anthropic, or held by a reserve): the last resort takes the
+// work, and that is logged once; when another comes back, new work goes there again.
+func TestALastResortIsUsedWhenEveryOtherIsOut(t *testing.T) {
+	logs := captureLogs(t, "info")
+	selector, auths, _ := lastResortSelector(t)
+	rejectByAnthropic(selector, "profile-b", time.Hour)
+	requireBackendSeriesPickWith(t, selector, plainRequest("first"), auths, "profile-a")
+	requireBackendSeriesPickWith(t, selector, plainRequest("second"), auths, "profile-a")
+	if got := strings.Count(logs.String(), "last-resort profile used: every other subscription is out"); got != 1 {
+		t.Fatalf("last-resort use logged %d times, want once:\n%s", got, logs.String())
+	}
+	if !strings.Contains(logs.String(), "profile=claude-primary") {
+		t.Fatalf("the last-resort use does not name the profile:\n%s", logs.String())
+	}
+	liftRejection(selector, "profile-b")
+	requireBackendSeriesPickWith(t, selector, plainRequest("third"), auths, "profile-b")
+
+	// Out by another profile's (non-last-resort) reserve counts as out too.
+	selector.reserveFor = func(name string) ProfileReserve {
+		if name == "claude-primary" {
+			return ProfileReserve{Percent: 30, LastResort: true}
+		}
+		return ProfileReserve{Percent: 100}
+	}
+	requireBackendSeriesPickWith(t, selector, plainRequest("fourth"), auths, "profile-a")
+	if got := strings.Count(logs.String(), "last-resort profile used: every other subscription is out"); got != 2 {
+		t.Fatalf("a second last-resort episode logged %d lines in all, want 2:\n%s", got, logs.String())
+	}
+}
+
+// A last resort comes before the paid API-key backup: the backup is used only once it is out too.
+func TestALastResortIsPreferredOverTheAPIBackup(t *testing.T) {
+	selector, auths, reset := backendAPIBackupTestSelector(t)
+	selector.names = map[string]string{"subscription-a": "sub-a", "subscription-b": "sub-b"}
+	selector.reserveFor = func(name string) ProfileReserve {
+		if name == "sub-a" {
+			return ProfileReserve{Percent: 100, LastResort: true}
+		}
+		return ProfileReserve{}
+	}
+	selector.observeQuota("subscription-b", backendWeeklyQuota{known: true, used: 0.2, resetsAt: reset})
+	requireBackendAPIBackupPick(t, selector, backendAPIBackupTestOptions("usable", false), auths, "subscription-b")
+	rejectByAnthropic(selector, "subscription-b", time.Hour)
+	requireBackendAPIBackupPick(t, selector, backendAPIBackupTestOptions("last-resort", false), auths, "subscription-a")
+	// A conversation already on the backup returns to the last resort.
+	onBackup := backendAPIBackupTestOptions("on-backup", false)
+	bindSession(selector, onBackup, "api-backup")
+	requireBackendAPIBackupPick(t, selector, onBackup, auths, "subscription-a")
+	rejectByAnthropic(selector, "subscription-a", time.Hour)
+	requireBackendAPIBackupPick(t, selector, backendAPIBackupTestOptions("all-out", false), auths, "api-backup")
 }
