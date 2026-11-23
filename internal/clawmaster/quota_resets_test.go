@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
@@ -124,8 +125,8 @@ func TestThePollAsksAsClaudeCodeAndLogsTheGrantBlock(t *testing.T) {
 	}
 	poll()
 	poll()
-	if !strings.HasPrefix(agent, "claude-cli/") || !strings.Contains(agent, "(external, cli)") {
-		t.Fatalf("User-Agent %q, want Claude Code's form", agent)
+	if want := helps.DefaultClaudeUserAgent(nil); agent != want {
+		t.Fatalf("User-Agent %q, want the baseline inference presents, %q", agent, want)
 	}
 	text := logs.String()
 	if n := strings.Count(text, "reset grants"); n != 1 {

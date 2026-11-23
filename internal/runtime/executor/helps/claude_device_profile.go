@@ -20,9 +20,9 @@ import (
 )
 
 const (
-	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.280 (external, cli)"
-	defaultClaudeFingerprintPackageVersion = "0.112.1"
-	defaultClaudeFingerprintRuntimeVersion = "v26.3.0"
+	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.330 (external, cli)"
+	defaultClaudeFingerprintPackageVersion = "0.128.0"
+	defaultClaudeFingerprintRuntimeVersion = "v26.12.1"
 	defaultClaudeFingerprintOS             = "MacOS"
 	defaultClaudeFingerprintArch           = "arm64"
 	claudeDeviceProfileTTL                 = 7 * 24 * time.Hour
@@ -596,6 +596,12 @@ func DefaultClaudeVersion(cfg *config.Config) string {
 		return strconv.Itoa(version.major) + "." + strconv.Itoa(version.minor) + "." + strconv.Itoa(version.patch)
 	}
 	return "2.1.280"
+}
+
+// DefaultClaudeUserAgent is the Claude Code User-Agent of the baseline device profile, for calls the
+// proxy makes on its own (the usage poll), so they present the same client as inference does.
+func DefaultClaudeUserAgent(cfg *config.Config) string {
+	return defaultClaudeDeviceProfile(cfg).UserAgent
 }
 
 func ApplyClaudeDefaultDeviceProfileHeaders(r *http.Request, cfg *config.Config) {

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
@@ -26,9 +27,6 @@ const (
 
 	claudeQuotaDefaultTimeout = 10 * time.Second
 
-	// claudeUsageUserAgent is the User-Agent the poll sends, Claude Code's own form: Anthropic decides
-	// whether an account may claim a limit reset (the cedar_ember block) partly by the client asking.
-	claudeUsageUserAgent    = "claude-cli/2.1.330 (external, cli)"
 	claudeQuotaMaxBodyBytes = 64 << 10
 )
 
@@ -86,7 +84,9 @@ func fetchClaudeUsage(ctx context.Context, auth *coreauth.Auth, do ClaudeQuotaRe
 	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("User-Agent", claudeUsageUserAgent)
+	// Claude Code's User-Agent, the baseline inference presents too: Anthropic decides whether an
+	// account may claim a limit reset (the cedar_ember block) partly by the client asking.
+	request.Header.Set("User-Agent", helps.DefaultClaudeUserAgent(nil))
 
 	response, err := do(ctx, auth, request)
 	if err != nil {

@@ -32,7 +32,7 @@ func TestPrepareBackendRequest(t *testing.T) {
 	}
 	request.Header.Set("Anthropic-Version", "2023-06-01")
 	request.Header.Set("Anthropic-Beta", "test-beta")
-	request.Header.Set("User-Agent", "claude-cli/2.1.285 (external, cli)")
+	request.Header.Set("User-Agent", "claude-cli/2.1.335 (external, cli)")
 	clean, model, err := prepareBackendRequest(request, BackendOptions{Model: "selected-model"}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +58,7 @@ func TestPrepareBackendRequest(t *testing.T) {
 			t.Fatalf("master header survived: %s", key)
 		}
 	}
-	if request.Header.Get("Anthropic-Version") != "2023-06-01" || request.Header.Get("User-Agent") != "claude-cli/2.1.285 (external, cli)" || request.URL.RawQuery != "" || request.Host != "" {
+	if request.Header.Get("Anthropic-Version") != "2023-06-01" || request.Header.Get("User-Agent") != "claude-cli/2.1.335 (external, cli)" || request.URL.RawQuery != "" || request.Host != "" {
 		t.Fatal("safe protocol header or URL sanitization incorrect")
 	}
 	bodyAgain, err := io.ReadAll(request.Body)

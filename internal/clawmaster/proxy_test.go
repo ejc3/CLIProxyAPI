@@ -125,7 +125,7 @@ func TestProxyInferenceCredentialBoundary(t *testing.T) {
 		"Authorization": {"Bearer MASTER-CANARY"}, "Cookie": {"session=MASTER-CANARY"}, "X-Api-Key": {"MASTER-CANARY"},
 		"X-Account-Id": {"MASTER-CANARY"}, "X-Custom-Identity": {"future-end-to-end"}, "Accept": {"application/json"},
 		"Anthropic-Version": {"2023-06-01"}, "Anthropic-Beta": {"test-beta"}, "Content-Type": {"application/json"},
-		"User-Agent": {"claude-cli/2.1.285 (external, cli)"}, "Accept-Encoding": {"gzip, deflate, br, zstd"},
+		"User-Agent": {"claude-cli/2.1.335 (external, cli)"}, "Accept-Encoding": {"gzip, deflate, br, zstd"},
 	}
 	for _, path := range []string{"/v1/messages?beta=true&identity=MASTER-CANARY", "/v1/messages/count_tokens"} {
 		resp, body := proxyTestRequest(t, client, http.MethodPost, path, `{"model":"master-model","messages":[]}`, headers.Clone())

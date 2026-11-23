@@ -13,7 +13,7 @@ func TestNativeClaudeProtocolHeadersBoundary(t *testing.T) {
 		"Accept":     {"application/json"}, "Accept-Encoding": {"gzip, deflate, br, zstd"},
 		"Anthropic-Beta": {"native-beta-a", "native-beta-b"}, "Anthropic-Version": {"2023-06-01"},
 		"X-Stainless-Os": {"MacOS"}, "X-Stainless-Arch": {"arm64"},
-		"X-Stainless-Package-Version": {"0.112.1"}, "X-Stainless-Runtime-Version": {"v26.3.0"},
+		"X-Stainless-Package-Version": {"0.128.0"}, "X-Stainless-Runtime-Version": {"v26.12.1"},
 		"X-Stainless-Async": {"async"}, "X-Client-Request-Id": {"per-request-correlation"},
 		"X-Claude-Code-Session-Id": {"11111111-2222-4333-8444-555555555555"},
 		"X-Claude-Code-Agent-Id":   {"tool-agent"}, "X-Claude-Code-Parent-Agent-Id": {"parent-agent"},
