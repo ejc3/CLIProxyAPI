@@ -176,6 +176,43 @@ func fableRejectionHeaders(headers http.Header) bool {
 	return !helps.ClaudeHeadersIndicateUnifiedRateLimitRejection(headers)
 }
 
+// sharedWindowRejectedHeaders reports a 429's headers naming the five-hour or weekly window as rejected: a
+// refusal of the whole subscription, whatever the request's model.
+func sharedWindowRejectedHeaders(headers http.Header) bool {
+	for _, name := range []string{"Anthropic-Ratelimit-Unified-5h-Status", "Anthropic-Ratelimit-Unified-7d-Status"} {
+		if strings.EqualFold(strings.TrimSpace(headers.Get(name)), "rejected") {
+			return true
+		}
+	}
+	return false
+}
+
+// rateLimitHeaderValue is what a rate-limit header value Anthropic sends looks like (an enum, a fraction, a
+// number of seconds or a timestamp); anything else is logged as "unrecognised".
+var rateLimitHeaderValue = regexp.MustCompile(`^[A-Za-z0-9_.:+-]{1,64}$`)
+
+// rateLimitHeaderSummary is a 429's Anthropic-Ratelimit-* and Retry-After headers as "Name=value" pairs,
+// sorted by name, for the log. Values outside rateLimitHeaderValue are not printed.
+func rateLimitHeaderSummary(headers http.Header) string {
+	pairs := make([]string, 0, len(headers))
+	for name, values := range headers {
+		canonical := http.CanonicalHeaderKey(name)
+		if canonical != "Retry-After" && !strings.HasPrefix(canonical, "Anthropic-Ratelimit-") {
+			continue
+		}
+		if !rateLimitHeaderValue.MatchString(canonical) {
+			continue
+		}
+		value := "unrecognised"
+		if len(values) == 1 && rateLimitHeaderValue.MatchString(strings.TrimSpace(values[0])) {
+			value = strings.TrimSpace(values[0])
+		}
+		pairs = append(pairs, canonical+"="+value)
+	}
+	sort.Strings(pairs)
+	return strings.Join(pairs, " ")
+}
+
 // fableRejectionUntil is when a Fable rejection ends: the 7d_oi reset Anthropic sent, else the Fable reset
 // the selector already knows. With neither, ok is false and the caller backs off instead.
 func fableRejectionUntil(headers http.Header, known time.Time, now time.Time) (until time.Time, ok bool) {

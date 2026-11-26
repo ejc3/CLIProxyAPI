@@ -146,6 +146,81 @@ func (s *backendSeriesSelector) observeFableRejection(authID string, headers htt
 	}
 }
 
+// A Fable request's 429 the headers do not mark as a Fable refusal is still read as one when the pool's own
+// figures, and those the 429 itself carried, say the Fable allowance is used up while the week and the
+// five-hour window are not. The header test alone has missed every such refusal seen in production: the
+// subscription was then held back from every model until its weekly reset, with a quarter of its week
+// unused, although Anthropic keeps serving other models there once Fable is used up.
+//
+// fableUsedUpAt is 97%, not 100%: the usage poll is in whole percent and up to a few minutes old, and the
+// refusal comes the moment the allowance runs out, so the last reading before it is often 96-99%. Below
+// that, a 429 is not taken for a used-up allowance. weekOpenBelow is 98%: a week (or five-hour window)
+// that close to its limit may itself be what Anthropic refused, so its 429 keeps the whole-subscription
+// hold. A wrong guess costs one more 429: the next request for another model there is refused too, and
+// that 429, not being a Fable request's, holds the whole subscription as before.
+const (
+	fableUsedUpAt = 0.97
+	weekOpenBelow = 0.98
+)
+
+// fableUsedUpWithWeekOpen reports whether a subscription's Fable allowance is used up while its week and
+// five-hour window are open, by the pool's figures and those of headers (a 429's), and no header names
+// the week or the five-hour window as rejected.
+func (s *backendSeriesSelector) fableUsedUpWithWeekOpen(authID string, headers http.Header) bool {
+	if strings.TrimSpace(authID) == "" || authID == s.backupAuthID || sharedWindowRejectedHeaders(headers) {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return false
+	}
+	s.initializeLocked()
+	now := s.nowOrReal()
+	fable, fableKnown := s.fableNowLocked(authID, now)
+	fableUsed := fable.UsedFraction
+	if fromHeaders, ok := ParseClaudeFableQuotaHeaders(headers); ok && fromHeaders.ResetsAt.After(now) {
+		fableKnown, fableUsed = true, max(fableUsed, fromHeaders.UsedFraction)
+	}
+	week := s.currentQuotaLocked(authID)
+	weekKnown, weekUsed := week.known, week.used
+	if fromHeaders, ok := parseBackendWeeklyQuotaHeaders(headers); ok && fromHeaders.resetsAt.After(now) {
+		weekKnown, weekUsed = true, max(weekUsed, fromHeaders.used)
+	}
+	if !fableKnown || fableUsed < fableUsedUpAt || !weekKnown || weekUsed >= weekOpenBelow {
+		return false
+	}
+	if five, known := s.fiveHourNowLocked(authID, now); known && five.UsedFraction >= weekOpenBelow {
+		return false
+	}
+	if used, ok := parseQuotaNumber(headers.Get("Anthropic-Ratelimit-Unified-5h-Utilization")); ok && used >= weekOpenBelow {
+		return false
+	}
+	return true
+}
+
+// noteFable429 logs, at most once an hour per subscription, the rate-limit headers of a 429 Anthropic sent
+// a Fable request and which hold followed, so the header test can be checked against what Anthropic sends.
+func (s *backendSeriesSelector) noteFable429(authID string, headers http.Header, fableOnly bool) {
+	if strings.TrimSpace(authID) == "" || authID == s.backupAuthID {
+		return
+	}
+	s.mu.Lock()
+	if s.fable429Log == nil {
+		s.fable429Log = newEvery(time.Hour)
+	}
+	limiter, name := s.fable429Log, s.profileNameLocked(authID)
+	s.mu.Unlock()
+	if !limiter.allow(authID) {
+		return
+	}
+	held := "subscription"
+	if fableOnly {
+		held = "fable"
+	}
+	lg().Info("Anthropic refused a Fable request", "profile", name, "held", held, "headers", rateLimitHeaderSummary(headers))
+}
+
 func (s *backendSeriesSelector) fableBlockedLocked(authID string) bool {
 	until, blocked := s.fableBlockedUntil[authID]
 	if blocked && !s.nowOrReal().Before(until) {

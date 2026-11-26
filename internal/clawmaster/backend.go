@@ -725,8 +725,10 @@ type backendSeriesSelector struct {
 	fable         map[string]ClaudeFableQuota
 	fableRevision map[string]uint64
 	// fableBlockedUntil: Anthropic refused a Fable request because the subscription's Fable allowance is
-	// used up (a 429 on the 7d_oi window alone). Until then Fable requests go elsewhere; others are unaffected.
+	// used up (a 429 on the 7d_oi window alone, or a Fable 429 while the pool's figures show Fable used up and
+	// the week open: fableUsedUpWithWeekOpen). Until then Fable requests go elsewhere; others are unaffected.
 	fableBlockedUntil map[string]time.Time
+	fable429Log       *every // noteFable429: one log line an hour per subscription
 	// quotaHoldWeekly: the hold in quotaBlockedUntil is Anthropic's rejection of the week alone (7d rejected,
 	// 5h not), the only kind a poll showing the week reset may lift (liftResetWeeklyHoldLocked).
 	quotaHoldWeekly map[string]bool
@@ -1417,11 +1419,21 @@ func setBackendResultPolicy(manager *coreauth.Manager, selector *backendSeriesSe
 		headers := internallogging.GetResponseHeaders(ctx)
 		fableRefused := !result.Success && result.Error != nil &&
 			backendFableRejection(result.Error.HTTPStatus, result.CredentialScope, result.Model, headers)
+		if selector != nil && !result.Success && result.Error != nil &&
+			result.Error.HTTPStatus == http.StatusTooManyRequests && isFableModel(result.Model) {
+			if !fableRefused {
+				fableRefused = selector.fableUsedUpWithWeekOpen(result.AuthID, headers)
+			}
+			selector.noteFable429(result.AuthID, headers, fableRefused)
+		}
 		if fableRefused {
 			// The selector holds the subscription back from Fable (observeFableRejection) until the reset or
 			// its backoff ends, and shortens that when a reset is learned: the core keeps no model cooldown of
-			// its own beside it, which nothing would shorten.
+			// its own beside it, which nothing would shorten. The executor may have marked the 429
+			// credential-scoped (its header test saw no Fable-only refusal); it is not, so the core
+			// benches neither the subscription nor its other models.
 			result.Error.Code = coreauth.ErrorCodeRequestScoped
+			result.CredentialScope = false
 			noteBackendMovedPastFable(ctx)
 		} else {
 			recordBackendAttempt(ctx, result)
