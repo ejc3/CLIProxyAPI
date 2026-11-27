@@ -135,6 +135,37 @@ func TestFable429OfAUsedUpWindowStillHoldsTheWholeSubscription(t *testing.T) {
 	}
 }
 
+// A 429 whose headers say the Fable allowance and the unified limit are still allowed (a per-minute limit,
+// say) is not read as a used-up Fable allowance, however close to its limit the pool's last Fable reading is:
+// it must not hold Fable back until the weekly reset.
+func TestFable429WithFableStillAllowedIsNotAFableHold(t *testing.T) {
+	for _, status := range []string{"allowed", "allowed_warning"} {
+		t.Run(status, func(t *testing.T) {
+			selector, _, reset := namedSelector(t)
+			now := reset.Add(-150 * time.Hour)
+			selector.now = func() time.Time { return now }
+			selector.observeQuota("profile-a", backendWeeklyQuota{known: true, used: 0.74, resetsAt: reset})
+			selector.observePolledFable("profile-a", ClaudeFableQuota{UsedFraction: 0.97, ResetsAt: reset}, selector.fablePollRevision("profile-a"))
+			manager := coreauth.NewManager(nil, selector, nil)
+			setBackendSeriesResultPolicy(manager, selector)
+
+			h := http.Header{}
+			h.Set("Anthropic-Ratelimit-Unified-Status", status)
+			h.Set("Anthropic-Ratelimit-Unified-7d_oi-Status", status)
+			h.Set("Anthropic-Ratelimit-Unified-Representative-Claim", "seven_day_overage_included")
+			h.Set("Retry-After", "30")
+			applyFable429(t, manager, "profile-a", testFableModel, h, 30*time.Second)
+
+			selector.mu.Lock()
+			fableBlocked, until := selector.fableBlockedLocked("profile-a"), selector.fableBlockedUntil["profile-a"]
+			selector.mu.Unlock()
+			if fableBlocked && !until.Before(reset) {
+				t.Fatalf("a 429 with Fable %s held Fable back until %v, the weekly reset", status, until)
+			}
+		})
+	}
+}
+
 // The logged headers carry only plain enums, numbers and timestamps; anything else is not printed.
 func TestRateLimitHeaderSummaryPrintsOnlyPlainValues(t *testing.T) {
 	h := http.Header{}

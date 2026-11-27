@@ -187,6 +187,18 @@ func sharedWindowRejectedHeaders(headers http.Header) bool {
 	return false
 }
 
+// fableStillAllowedHeaders reports a 429 whose headers say the unified limit or the Fable window is still
+// allowed: another limit (a per-minute one, say) refused the request, not a used-up Fable allowance.
+func fableStillAllowedHeaders(headers http.Header) bool {
+	for _, name := range []string{"Anthropic-Ratelimit-Unified-Status", "Anthropic-Ratelimit-Unified-7d_oi-Status"} {
+		switch strings.ToLower(strings.TrimSpace(headers.Get(name))) {
+		case "allowed", "allowed_warning":
+			return true
+		}
+	}
+	return false
+}
+
 // rateLimitHeaderValue is what a rate-limit header value Anthropic sends looks like (an enum, a fraction, a
 // number of seconds or a timestamp); anything else is logged as "unrecognised".
 var rateLimitHeaderValue = regexp.MustCompile(`^[A-Za-z0-9_.:+-]{1,64}$`)

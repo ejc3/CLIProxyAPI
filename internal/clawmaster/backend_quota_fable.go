@@ -164,10 +164,10 @@ const (
 )
 
 // fableUsedUpWithWeekOpen reports whether a subscription's Fable allowance is used up while its week and
-// five-hour window are open, by the pool's figures and those of headers (a 429's), and no header names
-// the week or the five-hour window as rejected.
+// five-hour window are open, by the pool's figures and those of headers (a 429's), no header names
+// the week or the five-hour window as rejected, and none says the unified limit or Fable is still allowed.
 func (s *backendSeriesSelector) fableUsedUpWithWeekOpen(authID string, headers http.Header) bool {
-	if strings.TrimSpace(authID) == "" || authID == s.backupAuthID || sharedWindowRejectedHeaders(headers) {
+	if strings.TrimSpace(authID) == "" || authID == s.backupAuthID || sharedWindowRejectedHeaders(headers) || fableStillAllowedHeaders(headers) {
 		return false
 	}
 	s.mu.Lock()
